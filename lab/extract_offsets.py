@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
-extract_offsets.py v9
+extract_offsets.py v10
 
-Confirmed from pair table analysis:
-  str_off  = pair[1]  off=0x2c4e0  (first_byte=0x00, v31 string table)
-  type_off = pair[19] off=0xc86d68 sz=0x1b6218 /88=20393
-  fdef_off = pair[10] off=0x928550 sz=0x157350
+Hardcoded pair indices confirmed from pair table dump:
+  pair[ 2]: off=0x0cd54c  sz=0x257150  first_byte=0x41 → name string table
+  pair[10]: off=0x928550  sz=0x157350  /12=117148       → Il2CppFieldDefinition[]
+  pair[19]: off=0xc86d68  sz=0x1b6218  /88=20393        → Il2CppTypeDefinition[]
 
-Key hypothesis: v31 Il2CppFieldDefinition is 16 bytes, not 12:
-  nameIdx   uint32  +0
-  typeIdx   uint32  +4
-  token     uint32  +8
-  offset    uint32  +12   ← field offset baked in, no separate table
-  → n_fields = 0x157350/16 = 87861
+String table starts at a non-null byte — cstr(0) gives us whatever the first
+name is. We find the right string offset by locating a known class name.
 
-Alternative: still 12 bytes, separate foff table missing/elsewhere.
+fieldDef entry size: test both 12 and 16 bytes.
+Field offset source: either baked into fdef (16-byte) or pair[11] (12-byte legacy).
 
-This version:
-  1. tries both 12-byte and 16-byte fieldDef interpretations
-  2. for each: dumps CharacterMotor first 20 fields with their offsets
-  3. whichever gives sane offsets for real field names is correct
-  4. also dumps pair[0] and pair[1] first 64 bytes to confirm string table
+pair[11]: off=0xa7f8a0  sz=0x1008a8  /4=262698  /12=87566
 
 Usage:  py -3 extract_offsets.py base.apk
 Output: offsets.json
@@ -33,6 +26,13 @@ OUT = "offsets.json"
 
 TARGET_FIELD  = "_currentLaneIndex"
 LANE_KEYWORDS = ["lane", "Lane"]
+
+# ── confirmed pair indices ────────────────────────────────────────────────────
+STR_PI  = 2    # name string table  (first_byte=0x41, sz=0x257150)
+TYPE_PI = 19   # Il2CppTypeDefinition[]  (sz/88=20393)
+FDEF_PI = 10   # Il2CppFieldDefinition[] (sz/12=117148 or sz/16=87861)
+FOFF_PI = 11   # candidate field offset table (sz/4=262698, /12=87566)
+
 TD_SIZE    = 88
 FS_OFF     = 32
 FC_OFF     = 64
@@ -54,36 +54,39 @@ print(f"[*] metadata version: {version}")
 def pair(idx):
     return struct.unpack_from("<II", meta_data, 8 + idx * 8)
 
-# ── confirmed from pair dump ──────────────────────────────────────────────────
-# pair[1]: first_byte=0x00, sz=0xa106c — string table (starts with null)
-# pair[2]: first_byte=0x41, sz=0x257150 — NOT string table (starts with 'A')
-# pair[10]: sz=0x157350 — fieldDef (divides by 12=117148 and 16=87861)
-# pair[19]: sz=0x1b6218 /88=20393 — typedef table
-
-STR_PI  = 1
-TYPE_PI = 19
-FDEF_PI = 10
-
 str_off,  str_sz  = pair(STR_PI)
 type_off, type_sz = pair(TYPE_PI)
 fdef_off, fdef_sz = pair(FDEF_PI)
+foff_off, foff_sz = pair(FOFF_PI)
 
 n_types = type_sz // TD_SIZE
-print(f"\n[*] tables: str=pair[{STR_PI}] off={str_off:#x}, "
-      f"typedef=pair[{TYPE_PI}] n={n_types}, "
-      f"fdef=pair[{FDEF_PI}] sz={fdef_sz:#x}")
+print(f"[*] n_types={n_types}")
+print(f"[*] str_off={str_off:#x}  type_off={type_off:#x}  "
+      f"fdef_off={fdef_off:#x}  foff_off={foff_off:#x}")
 
-# ── verify string table: print first 64 bytes ─────────────────────────────────
-print(f"\n[*] pair[{STR_PI}] first 64 bytes (string table verify):")
-chunk = meta_data[str_off:str_off+64]
+# ── string table: print first 32 bytes to confirm ────────────────────────────
+print(f"\n[*] pair[{STR_PI}] first 32 bytes:")
+chunk = meta_data[str_off:str_off+32]
 print("  hex: " + ' '.join(f'{b:02x}' for b in chunk))
 print("  asc: " + ''.join(chr(b) if 0x20 <= b < 0x7f else '.' for b in chunk))
 
+# cstr reads from str_off + rel, stopping at null
 def cstr(rel):
     end = meta_data.index(b'\x00', str_off + rel)
     return meta_data[str_off + rel:end].decode('utf-8', errors='replace')
 
+# ── verify typedef table: print first 5 type names ───────────────────────────
+print(f"\n[*] first 5 typedef names (verify string table):")
+for i in range(5):
+    b = type_off + i * TD_SIZE
+    try:
+        ni, nsi = struct.unpack_from("<II", meta_data, b)
+        print(f"  [{i}] nameIdx={ni:#x} → '{cstr(ni)}'  ns='{cstr(nsi)}'")
+    except Exception as e:
+        print(f"  [{i}] error: {e}")
+
 # ── build typedef table ───────────────────────────────────────────────────────
+print(f"\n[*] building typedef table...")
 all_types = []
 for i in range(n_types):
     b = type_off + i * TD_SIZE
@@ -100,103 +103,117 @@ for i in range(n_types):
     except Exception:
         all_types.append(None)
 
-motor_td = next((td for td in all_types
-                 if td and td['name'] == 'CharacterMotor'
-                 and td['ns'] == 'SYBO.RunnerCore.Character'), None)
 cic_td = next((td for td in all_types
                if td and td['name'] == 'CharacterInputController'
                and td['ns'] == 'SYBO.RunnerCore.Character'), None)
+motor_td = next((td for td in all_types
+                 if td and td['name'] == 'CharacterMotor'
+                 and td['ns'] == 'SYBO.RunnerCore.Character'), None)
 
-# ── try fieldDef as 12-byte vs 16-byte entries ────────────────────────────────
+print(f"[*] CIC:   {cic_td}")
+print(f"[*] Motor: field_start={motor_td['field_start'] if motor_td else 'NOT FOUND'}  "
+      f"field_count={motor_td['field_count'] if motor_td else '?'}")
 
-for FD_SIZE, label in ((12, "12-byte (classic)"), (16, "16-byte (v31 hypothesis)")):
+# ── fieldDef entry size probe ─────────────────────────────────────────────────
+# Try 12 and 16 byte entries. For each, dump CharacterMotor's first 15 fields.
+# The correct size gives real names in column 0 and sane offsets in last column.
+
+print(f"\n[*] fdef_sz={fdef_sz:#x}")
+for FD_SIZE in (12, 16):
     n_fields = fdef_sz // FD_SIZE
-    print(f"\n{'='*60}")
-    print(f"[*] fieldDef as {label}  n_fields={n_fields}")
+    print(f"\n{'='*70}")
+    print(f"[*] fieldDef entry_size={FD_SIZE}  n_fields={n_fields}")
 
+    # CharacterMotor first 15 fields
     if motor_td and motor_td['field_start'] != 0xFFFFFFFF:
         fs = motor_td['field_start']
         fc = motor_td['field_count']
-        print(f"\n  CharacterMotor: field_start={fs}  field_count={fc}")
-        print(f"  {'idx':<6} {'field_name':<40} {'raw_u32_0':<12} {'raw_u32_1':<12} "
-              f"{'raw_u32_2':<12}" + (f" {'raw_u32_3':<12}" if FD_SIZE==16 else ""))
-
-        for fi in range(min(20, fc)):
+        print(f"\n  CharacterMotor (fs={fs}, fc={fc}) first 15 fields:")
+        for fi in range(min(15, fc)):
             abs_fi = fs + fi
-            if abs_fi * FD_SIZE + FD_SIZE > fdef_sz:
-                print(f"  [{abs_fi}] out of range")
+            byte_off = abs_fi * FD_SIZE
+            if byte_off + FD_SIZE > fdef_sz:
+                print(f"    [{abs_fi}] out of range")
                 continue
-            b = fdef_off + abs_fi * FD_SIZE
-            if FD_SIZE == 12:
-                u0, u1, u2 = struct.unpack_from("<III", meta_data, b)
-                u3 = None
-            else:
-                u0, u1, u2, u3 = struct.unpack_from("<IIII", meta_data, b)
+            b = fdef_off + byte_off
+            words = struct.unpack_from(f"<{'I'*(FD_SIZE//4)}", meta_data, b)
             try:
-                fname = cstr(u0)
+                fname = cstr(words[0])
             except Exception:
-                fname = f"<bad_str@{u0:#x}>"
-            # mark sane offset (u2 for 12-byte, u3 for 16-byte)
-            foff_cand = u3 if FD_SIZE == 16 else u2
-            sane = "*" if 0x10 <= (foff_cand & 0x7FFFFFFF) <= 0x2000 else " "
-            row = (f"  [{abs_fi}]{sane} {fname:<40} {u0:#010x}  {u1:#010x}  "
-                   f"{u2:#010x}")
-            if u3 is not None:
-                row += f"  {u3:#010x}"
-            print(row)
+                fname = f"<bad@{words[0]:#x}>"
+            # last word as potential offset
+            last = words[-1]
+            inst  = last & 0x7FFFFFFF
+            stat  = bool(last & 0x80000000)
+            sane  = "*" if 0x10 <= inst <= 0x2000 and not stat else " "
+            wstrs = "  ".join(f"{w:#010x}" for w in words)
+            print(f"    [{abs_fi}]{sane} {fname:<35} | {wstrs}")
 
-    # also try CIC
+    # CIC fields
     if cic_td and cic_td['field_start'] != 0xFFFFFFFF:
         fs = cic_td['field_start']
         fc = cic_td['field_count']
-        print(f"\n  CharacterInputController: field_start={fs:#x}  field_count={fc}")
+        print(f"\n  CharacterInputController (fs={fs:#x}, fc={fc}) fields:")
         for fi in range(fc):
             abs_fi = fs + fi
-            if abs_fi * FD_SIZE + FD_SIZE > fdef_sz:
-                print(f"  [{abs_fi}] out of range")
+            byte_off = abs_fi * FD_SIZE
+            if byte_off + FD_SIZE > fdef_sz:
+                print(f"    [{abs_fi}] out of range")
                 continue
-            b = fdef_off + abs_fi * FD_SIZE
-            if FD_SIZE == 12:
-                u0, u1, u2 = struct.unpack_from("<III", meta_data, b)
-                u3 = None
-            else:
-                u0, u1, u2, u3 = struct.unpack_from("<IIII", meta_data, b)
+            b = fdef_off + byte_off
+            words = struct.unpack_from(f"<{'I'*(FD_SIZE//4)}", meta_data, b)
             try:
-                fname = cstr(u0)
+                fname = cstr(words[0])
             except Exception:
-                fname = f"<bad_str@{u0:#x}>"
-            foff_cand = u3 if FD_SIZE == 16 else u2
-            sane = "*" if 0x10 <= (foff_cand & 0x7FFFFFFF) <= 0x2000 else " "
-            row = f"  [{abs_fi}]{sane} {fname:<40} u3={foff_cand:#010x}"
-            print(row)
+                fname = f"<bad@{words[0]:#x}>"
+            last = words[-1]
+            inst = last & 0x7FFFFFFF
+            stat = bool(last & 0x80000000)
+            sane = "*" if 0x10 <= inst <= 0x2000 and not stat else " "
+            wstrs = "  ".join(f"{w:#010x}" for w in words)
+            print(f"    [{abs_fi}]{sane} {fname:<35} | {wstrs}")
 
-# ── raw hex of first 3 fieldDef entries ───────────────────────────────────────
-print(f"\n[*] raw hex: first 3 × 16 bytes at fdef_off={fdef_off:#x}:")
+    # Also try pair[11] as the offset source (12-byte fdef, separate foff)
+    if FD_SIZE == 12:
+        print(f"\n  Pair[11] as foff (sz={foff_sz:#x}, /4={foff_sz//4}):")
+        print(f"  CharacterMotor first 15 with pair[11] offsets:")
+        if motor_td and motor_td['field_start'] != 0xFFFFFFFF:
+            fs = motor_td['field_start']
+            for fi in range(min(15, motor_td['field_count'])):
+                abs_fi = fs + fi
+                b = fdef_off + abs_fi * FD_SIZE
+                try:
+                    ni, = struct.unpack_from("<I", meta_data, b)
+                    fname = cstr(ni)
+                except Exception:
+                    fname = f"<bad>"
+                # pair[11] as foff
+                if abs_fi * 4 + 4 <= foff_sz:
+                    raw, = struct.unpack_from("<I", meta_data, foff_off + abs_fi * 4)
+                    inst = raw & 0x7FFFFFFF
+                    stat = bool(raw & 0x80000000)
+                    sane = "*" if 0x10 <= inst <= 0x2000 and not stat else " "
+                    print(f"    [{abs_fi}]{sane} {fname:<35} | p11={raw:#010x}  "
+                          f"inst={inst:#x}  static={stat}")
+                else:
+                    print(f"    [{abs_fi}]  {fname:<35} | p11=OOB")
+
+# ── raw hex: first 3 fdef entries × 16 bytes ─────────────────────────────────
+print(f"\n[*] raw fdef first 3 entries × 16 bytes at {fdef_off:#x}:")
 for i in range(3):
-    chunk = meta_data[fdef_off + i*16 : fdef_off + i*16 + 16]
-    hex_s = ' '.join(f'{b:02x}' for b in chunk)
-    u32s  = struct.unpack_from("<IIII", meta_data, fdef_off + i*16)
+    b = fdef_off + i * 16
+    chunk = meta_data[b:b+16]
+    hexs  = ' '.join(f'{x:02x}' for x in chunk)
+    words = struct.unpack_from("<IIII", meta_data, b)
     names = []
-    for u in u32s:
-        try:
-            names.append(repr(cstr(u)))
-        except Exception:
-            names.append(f"<{u:#x}>")
-    print(f"  [{i}] {hex_s}  u32={[f'{u:#010x}' for u in u32s]}")
-    print(f"       as_names={names}")
+    for w in words:
+        try:    names.append(repr(cstr(w)))
+        except: names.append(f"<{w:#x}>")
+    print(f"  [{i}] {hexs}")
+    print(f"       {[f'{w:#010x}' for w in words]}")
+    print(f"       as_str: {names}")
 
-# ── also dump raw hex of CIC typedef to double-check FC_OFF ───────────────────
-if cic_td:
-    b = type_off + cic_td['typedef_idx'] * TD_SIZE
-    print(f"\n[*] CIC raw typedef hex (88 bytes) at {b:#x}:")
-    for row in range(0, 88, 16):
-        chunk = meta_data[b+row:b+row+16]
-        hex_s = ' '.join(f'{c:02x}' for c in chunk)
-        u32s  = struct.unpack_from("<IIII", meta_data, b+row)
-        print(f"  +{row:02x}  {hex_s}  "
-              f"{[f'{u:#010x}' for u in u32s]}")
-
-result = {"metadata_version": version, "note": "diagnostic run — see stdout"}
+result = {"metadata_version": version, "note": "v10 diagnostic"}
 with open(OUT, 'w') as f:
     json.dump(result, f, indent=2)
 print(f"\n[*] written to {OUT}")
