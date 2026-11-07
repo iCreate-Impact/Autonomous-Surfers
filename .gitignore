@@ -18,3 +18,4 @@ Thumbs.db
 .git\
 lab/base.apk
 lab/offsets.json
+lab/lane_hits.json
