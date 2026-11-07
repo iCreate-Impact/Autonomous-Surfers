@@ -44,7 +44,7 @@
 // ── compile-time bypass ───────────────────────────────────────────────────────
 // Set to the GPA of the lane field (CE_HVA - HCPtrStart from Stage 2 log).
 // Set to 0 to run full self-discovery.
-#define DIRECT_LANE_GPA  0x00000000AF32599CULL
+#define DIRECT_LANE_GPA  0x00000000AF3259ACULL
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
