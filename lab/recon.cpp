@@ -1,38 +1,44 @@
 /*
- * recon.dll v3 — VirtualBox guest RAM recon
+ * recon.dll v4 — VirtualBox guest RAM recon
  * Target:  HD-Player.exe (BlueStacks 5+)
  * Compile: x64, MSVC or clang-cl
  *
  *   cl /LD /O2 /EHsc recon.cpp /Fe:recon.dll /link /DLL psapi.lib
  *
- * Changes from v2:
- *   – DumpFuncBytes: logs first 64 bytes of each export as hex.
- *     Tells us exactly what VMR3GetUVM and PGMR3PhysGetRamRangeCount
- *     actually do — are they reading from a global? do they check the arg?
+ * What v3 taught us (from function byte analysis):
  *
- *   – NullArgTest: calls g_fnRangeCount(NULL) and g_fnGetState(NULL).
- *     If those also return 0xFFFFFFFF / 31, the functions ignore their
- *     argument entirely and read from a global instead.
+ *  VMR3GetVM    @ +32: cmp [rcx], 0x19700823  → real UVM magic in this build
+ *               @ +48: mov rax, [rcx+8]; ret  → PVM is stored at UVM+8
  *
- *   – QueryTargetHVA: VirtualQuery on TARGET_HVA. Gives us the guest RAM
- *     region base and size for free. If guest RAM starts at GPA 0, then
- *     GPA = TARGET_HVA − region_base. We test this with a live read.
+ *  VMR3GetUVM   @ +48: cmp [rcx], 0x1E        → takes PVM (checks cCpus ≤ 30)
+ *  PGMR3PhysGetRamRangeCount: same cCpus check → also takes PVM
+ *  PGMPhysSimpleRead/WriteGCPhys: mov rdi/rsi, rcx → take PVM as first arg
  *
- *   – WalkPVMStruct: for each PVM candidate from the VA scan, dumps the
- *     first 256 struct bytes and brute-forces every 8-byte aligned field
- *     as a potential pUVM, testing each via g_fnRangeCount. Finds the
- *     real pUVM offset even if BlueStacks moved it.
+ *  PGMR3PhysGetRange: saves R9 to rsi at entry  → 4-arg signature; call with extra=0
  *
- *   – ScanForHCPtr: scans all readable non-image private/mapped memory
- *     for RTHCUINTPTR values that land inside the guest RAM region found
- *     by QueryTargetHVA. Those are HCPtrStart candidates — they anchor
- *     the PGMPHYSRANGEINFO structs, which is part of the PVM/PGM layout.
+ *  VMR3GetState / PGMR3PhysGetRamRangeCount: return sentinel (31 / 0xFFFFFFFF)
+ *  when called with wrong magic → explains every failure in v2/v3.
+ *
+ *  TARGET_HVA: State=FREE in v3 → CE address is from prior game run, stale.
+ *  We skip it entirely. Once we have the range table, do a fresh CE scan and
+ *  feed the new HVA back (see LOG output for instructions).
+ *
+ * What v4 does:
+ *   1. Scan ALL committed non-image private/mapped memory at PAGE-ALIGNED
+ *      addresses only for first dword == 0x19700823 → PUVM candidates
+ *   2. For each PUVM:
+ *        pVM = *(void**)(pUVM + 8)              [from VMR3GetVM disasm]
+ *        try RangeCount(pVM)   -- should work   (cCpus ≤ 30 check passes)
+ *        try RangeCount(pUVM)  -- probably fails (0x19700823 >> 30)
+ *        log both so we confirm which handle each function expects
+ *   3. With the working handle, dump the full range table
+ *   4. Test-read 16 bytes at GPA 0x0 using pVM to confirm read path
+ *   5. Log HCPtrStart values and instruction for the user to get the lane GPA
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
-#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdint.h>
 
@@ -44,26 +50,28 @@ typedef uint64_t  RTGCPHYS;
 typedef uintptr_t RTHCUINTPTR;
 #define VINF_SUCCESS 0
 
+// UVM magic discovered from VMR3GetVM disassembly:
+//   81 39 23 08 70 19  =  cmp dword ptr [rcx], 0x19700823
+static const uint32_t UVM_MAGIC = 0x19700823;
+
 typedef struct {
-    RTGCPHYS    GCPhysStart;
-    RTGCPHYS    GCPhysEnd;
-    RTHCUINTPTR HCPtrStart;
-    bool        fHasMapping;
+    RTGCPHYS    GCPhysStart;    // +0x00  (8 bytes)
+    RTGCPHYS    GCPhysEnd;      // +0x08  (8 bytes)
+    RTHCUINTPTR HCPtrStart;     // +0x10  (8 bytes)
+    bool        fHasMapping;    // +0x18  (1 byte)
 } PGMPHYSRANGEINFO;
 
 typedef PUVM     (WINAPI* pfnVMR3GetUVM)               (PVM pVM);
 typedef PVM      (WINAPI* pfnVMR3GetVM)                (PUVM pUVM);
 typedef unsigned (WINAPI* pfnVMR3GetState)             (PUVM pUVM);
-typedef uint32_t (WINAPI* pfnPGMR3PhysGetRamRangeCount)(PUVM pUVM);
-typedef int      (WINAPI* pfnPGMR3PhysGetRange)        (PUVM pUVM, uint32_t iRange, PGMPHYSRANGEINFO* pInfo);
+typedef uint32_t (WINAPI* pfnPGMR3PhysGetRamRangeCount)(PUVM pUVM);  // actually takes PVM in this build
+// PGMR3PhysGetRange has a 4-arg signature in this BlueStacks build (R9 is saved on entry).
+// Pass dwExtra=0; the 4th arg appears to be unused or a flags field.
+typedef int      (WINAPI* pfnPGMR3PhysGetRange)        (PUVM pUVM, uint32_t iRange, uintptr_t dwExtra, PGMPHYSRANGEINFO* pInfo);
 typedef int      (WINAPI* pfnPGMPhysSimpleReadGCPhys)  (PVM pVM, void* pvDst, RTGCPHYS GCPhysSrc, size_t cb);
 typedef int      (WINAPI* pfnPGMPhysSimpleWriteGCPhys) (PVM pVM, RTGCPHYS GCPhysDst, const void* pvSrc, size_t cb);
 
-// HVA of lane value from CE — stable within session, shifts on restart.
-#define TARGET_HVA  ((uintptr_t)0x2BDE7F7335CULL)
 #define LOG_PATH    "X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt"
-
-static const uint32_t VM_MAGIC = 0x0fd00fd0;
 
 static pfnVMR3GetUVM                g_fnGetUVM;
 static pfnVMR3GetVM                 g_fnGetVM;
@@ -82,404 +90,246 @@ static FILE* g_log = nullptr;
     OutputDebugStringA(_buf); \
 } while(0)
 
-// ── guest RAM region (filled by QueryTargetHVA) ───────────────────────────────
+// ── handle pair ───────────────────────────────────────────────────────────────
 
-static uintptr_t g_guestRAMBase = 0;   // HCPtrStart of first range
-static uintptr_t g_guestRAMSize = 0;   // size of that region
+struct Handles {
+    PUVM pUVM;          // struct with magic 0x19700823; accepted by VMR3GetVM
+    PVM  pVM;           // struct at pUVM+8; accepted by PGMR3Phys* and PGMPhysSimple*
+    PUVM rangeHandle;   // whichever of pUVM/pVM PGMR3PhysGetRamRangeCount accepts
+    uint32_t nRanges;
+    bool valid;
+};
 
-// ── 1. function byte dump ─────────────────────────────────────────────────────
+// ── UVM scan ──────────────────────────────────────────────────────────────────
 //
-// Logs first 64 bytes of a function as 4 rows of 16 hex bytes.
-// In 99% of cases this is enough to see: does the function dereference
-// RCX (its first argument), does it call into something else, does it
-// return a constant, does it read from a RIP-relative global?
+// Walk all committed non-image pages, checking ONLY page-aligned addresses.
+// Reduces false-positive rate vs scanning every 4 bytes, since VMR3GetVM
+// rejects any pointer where rcx & 0xFFF != 0.
 
-static void DumpFuncBytes(const char* name, void* fn)
+static Handles ScanForUVM()
 {
-    if (!fn) return;
-    uint8_t* p = (uint8_t*)fn;
-    LOG("[func] %s @ %p", name, fn);
-    __try {
-        for (int row = 0; row < 4; row++) {
-            char buf[80]; char* out = buf;
-            for (int col = 0; col < 16; col++)
-                out += sprintf_s(out, (size_t)(buf + sizeof(buf) - out), "%02X ", p[row * 16 + col]);
-            LOG("[func]   +%02d: %s", row * 16, buf);
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[func]   (read threw)");
-    }
-}
-
-// ── 2. null-arg test ──────────────────────────────────────────────────────────
-//
-// If g_fnRangeCount(NULL) also returns 0xFFFFFFFF and g_fnGetState(NULL)
-// also returns 31, those functions are not dereferencing their argument.
-// They're reading from a process-global or ring-0 shared region.
-
-static void NullArgTest()
-{
-    LOG("[nullarg] calling RangeCount(NULL) and GetState(NULL)");
-
-    uint32_t rc_null = 0xDEAD;
-    unsigned st_null = 0xDEAD;
-    bool rcThrew = false, stThrew = false;
-
-    __try { rc_null = g_fnRangeCount(nullptr); } __except(EXCEPTION_EXECUTE_HANDLER) { rcThrew = true; }
-    __try { st_null = g_fnGetState(nullptr);   } __except(EXCEPTION_EXECUTE_HANDLER) { stThrew = true; }
-
-    LOG("[nullarg] RangeCount(NULL)=%u%s", rc_null, rcThrew ? " THREW" : "");
-    LOG("[nullarg] GetState(NULL)=%u%s",   st_null, stThrew ? " THREW" : "");
-    LOG("[nullarg] conclusion: RangeCount %s argument",
-        rcThrew ? "CRASHES on" :
-        rc_null == 0xFFFFFFFF ? "IGNORES (returns same 0xFFFFFFFF)" :
-        "USES (returned different value)");
-    LOG("[nullarg] conclusion: GetState %s argument",
-        stThrew ? "CRASHES on" :
-        st_null == 31 ? "IGNORES (returns same 31)" :
-        "USES (returned different value)");
-}
-
-// ── 3. VirtualQuery on TARGET_HVA ─────────────────────────────────────────────
-//
-// Since we're injected into HD-Player.exe, we can VirtualQuery the lane HVA
-// directly. This tells us the guest RAM region boundaries without any VBox API.
-//
-// If guest RAM starts at GPA 0x00000000 (standard VBox x86 layout), then:
-//     GPA = TARGET_HVA − region_AllocationBase
-//
-// We test this assumption with a direct dereference (we're inside the process)
-// and compare the value to what CE reported (-1/0/1).
-
-static void QueryTargetHVA()
-{
-    LOG("[hva] querying TARGET_HVA=0x%016llX", (unsigned long long)TARGET_HVA);
-
-    MEMORY_BASIC_INFORMATION mbi = {};
-    if (!VirtualQuery((void*)TARGET_HVA, &mbi, sizeof(mbi))) {
-        LOG("[hva] VirtualQuery failed le=%u", GetLastError());
-        return;
-    }
-
-    const char* typStr = mbi.Type  == MEM_PRIVATE ? "PRIVATE" :
-                         mbi.Type  == MEM_MAPPED  ? "MAPPED"  :
-                         mbi.Type  == MEM_IMAGE   ? "IMAGE"   : "?";
-    const char* stStr  = mbi.State == MEM_COMMIT  ? "COMMIT"  :
-                         mbi.State == MEM_RESERVE ? "RESERVE" : "FREE";
-
-    LOG("[hva] BaseAddress    = %p", mbi.BaseAddress);
-    LOG("[hva] AllocationBase = %p", mbi.AllocationBase);
-    LOG("[hva] RegionSize     = 0x%llX (%.1f MB)",
-        (unsigned long long)mbi.RegionSize,
-        mbi.RegionSize / (1024.0 * 1024.0));
-    LOG("[hva] State=%s  Type=%s  Protect=%02X", stStr, typStr, mbi.Protect & 0xFF);
-
-    // Store for ScanForHCPtr
-    g_guestRAMBase = (uintptr_t)mbi.AllocationBase;
-    g_guestRAMSize = mbi.RegionSize;
-
-    uintptr_t offsetInRegion = TARGET_HVA - (uintptr_t)mbi.AllocationBase;
-    LOG("[hva] offset in region = 0x%llX", (unsigned long long)offsetInRegion);
-    LOG("[hva] estimated GPA (if GCPhysStart=0) = 0x%016llX", (unsigned long long)offsetInRegion);
-
-    // Direct dereference — we ARE inside the process
-    if (mbi.State == MEM_COMMIT &&
-        (mbi.Protect & PAGE_NOACCESS) == 0 &&
-        (mbi.Protect & PAGE_GUARD)    == 0)
-    {
-        int32_t laneVal = 0xDEAD;
-        bool threw = false;
-        __try { laneVal = *(int32_t*)TARGET_HVA; }
-        __except(EXCEPTION_EXECUTE_HANDLER) { threw = true; }
-
-        if (!threw)
-            LOG("[hva] direct read: lane=%d  (expect -1, 0, or 1)", laneVal);
-        else
-            LOG("[hva] direct read threw (page not accessible from this thread?)");
-    }
-
-    // Now try PGMPhysSimpleReadGCPhys at estimated GPA, using the two VA-scan PVM
-    // candidates as PVM argument. Even if UVM is wrong, the PVM arg might work.
-    // (Logged below by WalkPVMStruct after it finds pUVM.)
-    LOG("[hva] estimated GPA stored: 0x%016llX", (unsigned long long)offsetInRegion);
-}
-
-// ── 4. PVM struct walk ────────────────────────────────────────────────────────
-//
-// For a PVM candidate found by magic scan:
-//   a) Dump first 256 bytes as hex (shows struct layout in the log)
-//   b) Walk every 8-byte field 0–512 and try it as pUVM via g_fnRangeCount.
-//      Fields that return ranges in [1,128] are strong pUVM candidates.
-//   c) For each promising candidate, also try g_fnGetRange(candidate, 0, &info)
-//      and log the first range. If it matches g_guestRAMBase, we have full
-//      confirmation.
-//   d) Try PGMPhysSimpleReadGCPhys at the estimated GPA using the pVM directly
-//      (some BlueStacks builds have PGMR3 functions that accept PVM, not PUVM).
-
-static void WalkPVMStruct(PVM pvm, uintptr_t estimatedGPA)
-{
-    LOG("[walk] PVM candidate @ %p", pvm);
-    uint8_t* base = (uint8_t*)pvm;
-
-    // ── a) hex dump first 256 bytes ───────────────────────────────────────────
-    LOG("[walk] struct bytes (first 256):");
-    __try {
-        for (int row = 0; row < 16; row++) {
-            char hex[80]; char* out = hex;
-            int rowOff = row * 16;
-            for (int col = 0; col < 16; col++)
-                out += sprintf_s(out, (size_t)(hex + sizeof(hex) - out),
-                                 "%02X ", base[rowOff + col]);
-            // show 8-byte pointer at start of this row
-            uintptr_t ptr = *(uintptr_t*)(base + rowOff);
-            out += sprintf_s(out, 32, " ptr=%016llX", (unsigned long long)ptr);
-            LOG("[walk]   +%03X: %s", rowOff, hex);
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG("[walk]   hex dump threw at some row");
-    }
-
-    // ── b) field walk: try each 8-byte offset as pUVM ─────────────────────────
-    LOG("[walk] field walk (testing each offset as pUVM via RangeCount):");
-    bool foundAny = false;
-
-    for (int off = 0; off <= 512; off += 8) {
-        __try {
-            uintptr_t val = *(uintptr_t*)(base + off);
-            if (val < 0x10000 || val > 0x7FFFFFFFFFFFULL) continue;
-
-            uint32_t ranges = 0xDEAD;
-            bool threw = false;
-            __try { ranges = g_fnRangeCount((PUVM)val); }
-            __except(EXCEPTION_EXECUTE_HANDLER) { threw = true; }
-
-            if (threw) continue;  // silent skip for throws
-
-            // Log ANY result that isn't the sentinel 0xFFFFFFFF
-            if (ranges != 0xFFFFFFFF) {
-                LOG("[walk]   offset +%03X  val=%016llX  ranges=%u  *** NON-SENTINEL ***",
-                    off, (unsigned long long)val, ranges);
-                foundAny = true;
-
-                if (ranges >= 1 && ranges <= 128) {
-                    LOG("[walk]   *** PROMISING pUVM at offset +%03X ***", off);
-
-                    // Also get state and GetVM
-                    unsigned state = 0xDEAD;
-                    PVM gotPVM = nullptr;
-                    __try { state  = g_fnGetState((PUVM)val); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                    __try { gotPVM = g_fnGetVM((PUVM)val);    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-                    uint32_t gotMagic = 0;
-                    __try { if (gotPVM) gotMagic = *(uint32_t*)gotPVM; }
-                    __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-                    LOG("[walk]   state=%u  GetVM=%p  magic=%08X", state, gotPVM, gotMagic);
-
-                    // Try GetRange to get HCPtrStart
-                    PGMPHYSRANGEINFO info = {};
-                    int rc = -1;
-                    __try { rc = g_fnGetRange((PUVM)val, 0, &info); }
-                    __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-                    LOG("[walk]   GetRange(0): rc=%d  GC=%016llX-%016llX  HC=%016llX  mapped=%d",
-                        rc,
-                        (unsigned long long)info.GCPhysStart,
-                        (unsigned long long)info.GCPhysEnd,
-                        (unsigned long long)info.HCPtrStart,
-                        (int)info.fHasMapping);
-
-                    if (g_guestRAMBase && info.HCPtrStart == g_guestRAMBase)
-                        LOG("[walk]   *** HCPtrStart MATCHES guest RAM region — CONFIRMED ***");
-                }
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    if (!foundAny)
-        LOG("[walk]   no non-sentinel ranges found (all fields returned 0xFFFFFFFF)");
-
-    // ── c) try functions with pvm directly (swapped role test) ───────────────
-    // Some BlueStacks builds accept PVM where standard VBox expects PUVM.
-    LOG("[walk] direct PVM-as-PUVM tests:");
-    {
-        uint32_t rDirect = 0xDEAD; bool rThrew = false;
-        unsigned sDirect = 0xDEAD; bool sThrew = false;
-        __try { rDirect = g_fnRangeCount((PUVM)pvm); } __except(EXCEPTION_EXECUTE_HANDLER) { rThrew = true; }
-        __try { sDirect = g_fnGetState((PUVM)pvm);   } __except(EXCEPTION_EXECUTE_HANDLER) { sThrew = true; }
-        LOG("[walk]   RangeCount(pvm)=%u%s", rDirect, rThrew ? " THREW" : "");
-        LOG("[walk]   GetState(pvm)=%u%s",   sDirect, sThrew ? " THREW" : "");
-
-        if (!rThrew && rDirect >= 1 && rDirect <= 128) {
-            LOG("[walk]   *** PVM accepted as PUVM by RangeCount! ranges=%u ***", rDirect);
-            PGMPHYSRANGEINFO info = {};
-            int rc = -1;
-            __try { rc = g_fnGetRange((PUVM)pvm, 0, &info); }
-            __except(EXCEPTION_EXECUTE_HANDLER) {}
-            LOG("[walk]   GetRange(pvm,0): rc=%d  GC=%016llX  HC=%016llX",
-                rc,
-                (unsigned long long)info.GCPhysStart,
-                (unsigned long long)info.HCPtrStart);
-        }
-    }
-
-    // ── d) direct read at estimated GPA using pvm as PVM arg ─────────────────
-    if (estimatedGPA != 0 && !g_fnRead) return;
-    if (estimatedGPA != 0) {
-        int32_t val = 0xDEAD;
-        int rc = -1;
-        bool threw = false;
-        __try { rc = g_fnRead(pvm, &val, (RTGCPHYS)estimatedGPA, sizeof(val)); }
-        __except(EXCEPTION_EXECUTE_HANDLER) { threw = true; }
-        LOG("[walk]   Read(pvm, GPA=0x%llX): rc=%d  val=%d%s",
-            (unsigned long long)estimatedGPA, rc, val, threw ? " THREW" : "");
-        if (rc == VINF_SUCCESS)
-            LOG("[walk]   *** lane=%d (expect -1/0/1) — PVM is correct ***", val);
-    }
-}
-
-// ── 5. scan for HCPtr values inside the guest RAM region ──────────────────────
-//
-// Walk all readable non-image private/mapped memory.
-// Any 8-byte aligned value that falls INSIDE [g_guestRAMBase, g_guestRAMBase+size)
-// is a potential HCPtrStart stored somewhere — likely inside PGMPHYSRANGEINFO,
-// which lives inside the PVM's pgm component.
-// If we find such a value, the 8 bytes BEFORE it are GCPhysStart of that range,
-// which lets us compute GPA = GCPhysStart + (TARGET_HVA − HCPtrStart).
-
-static void ScanForHCPtr()
-{
-    if (!g_guestRAMBase || !g_guestRAMSize) {
-        LOG("[hcptr] guest RAM region unknown, skipping");
-        return;
-    }
-
-    LOG("[hcptr] scanning for HCPtr values in [%016llX, %016llX)",
-        (unsigned long long)g_guestRAMBase,
-        (unsigned long long)(g_guestRAMBase + g_guestRAMSize));
+    Handles result = {};
 
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
     uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
     uintptr_t end  = (uintptr_t)si.lpMaximumApplicationAddress;
 
-    uint32_t found = 0;
-
-    while (addr < end && found < 32) {
-        MEMORY_BASIC_INFORMATION mbi = {};
-        if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) { addr += 0x1000; continue; }
-
-        size_t sz = mbi.RegionSize;
-        bool ok = (mbi.State  == MEM_COMMIT) &&
-                  (mbi.Type   != MEM_IMAGE)  &&
-                  (mbi.Protect & 0xFF) != PAGE_NOACCESS &&
-                  (mbi.Protect & 0xFF) != PAGE_EXECUTE  &&
-                  !(mbi.Protect & PAGE_GUARD) &&
-                  sz >= 8;
-
-        if (ok) {
-            uint8_t* p    = (uint8_t*)addr;
-            uint8_t* pEnd = p + sz - 7;
-            while (p < pEnd) {
-                __try {
-                    uintptr_t val = *(uintptr_t*)p;
-                    if (val >= g_guestRAMBase && val < g_guestRAMBase + g_guestRAMSize) {
-                        // This looks like an HCPtrStart. The PGMPHYSRANGEINFO layout is:
-                        //   GCPhysStart (+0, 8 bytes)
-                        //   GCPhysEnd   (+8, 8 bytes)
-                        //   HCPtrStart  (+16, 8 bytes)
-                        //   fHasMapping (+24, 1 byte)
-                        // So GCPhysStart is at p - 16.
-                        RTGCPHYS gcStart = 0, gcEnd = 0;
-                        __try {
-                            gcStart = *(RTGCPHYS*)(p - 16);
-                            gcEnd   = *(RTGCPHYS*)(p -  8);
-                        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-                        uint64_t rangeSize = (gcEnd > gcStart) ? (gcEnd - gcStart + 1) : 0;
-                        RTGCPHYS estimatedGPA = gcStart + (RTGCPHYS)(TARGET_HVA - val);
-
-                        LOG("[hcptr] HCPtr=%016llX @ addr=%p  GC:%016llX-%016llX  sz=%.1fMB",
-                            (unsigned long long)val, p,
-                            (unsigned long long)gcStart,
-                            (unsigned long long)gcEnd,
-                            rangeSize / (1024.0 * 1024.0));
-                        LOG("[hcptr]   estimated GPA for TARGET_HVA = 0x%016llX",
-                            (unsigned long long)estimatedGPA);
-
-                        // Also try to find which PVM owns this by scanning backwards
-                        // for VM_MAGIC from p (the PGMPHYSRANGEINFO is embedded in PVM.pgm)
-                        found++;
-                        p += 8;
-                        continue;
-                    }
-                    p += 8;
-                } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    p += 0x1000;
-                }
-            }
-        }
-
-        addr += sz;
-    }
-
-    if (found == 0)
-        LOG("[hcptr] no HCPtr values found in guest RAM range");
-    else
-        LOG("[hcptr] found %u HCPtr candidate(s)", found);
-}
-
-// ── VA space scan (from v2, simplified) ──────────────────────────────────────
-
-struct PVMHit { PVM pvm; };
-static PVMHit g_pvmHits[8];
-static int    g_nPVMHits = 0;
-
-static void CollectPVMHits()
-{
-    SYSTEM_INFO si = {};
-    GetSystemInfo(&si);
-    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
-    uintptr_t end  = (uintptr_t)si.lpMaximumApplicationAddress;
-    uint64_t  scanned = 0, hits = 0;
+    uint64_t pagesChecked = 0, hits = 0;
 
     while (addr < end) {
         MEMORY_BASIC_INFORMATION mbi = {};
         if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) { addr += 0x1000; continue; }
-        size_t sz = mbi.RegionSize;
 
-        bool ok = (mbi.State  == MEM_COMMIT) &&
-                  (mbi.Type   != MEM_IMAGE)  &&
-                  (mbi.Protect & 0xFF) != PAGE_NOACCESS &&
-                  (mbi.Protect & 0xFF) != PAGE_EXECUTE  &&
-                  !(mbi.Protect & PAGE_GUARD) &&
-                  sz >= 4;
+        size_t  rSize  = mbi.RegionSize;
+        bool    commit = (mbi.State   == MEM_COMMIT);
+        bool    noExec = (mbi.Protect & 0xFF) != PAGE_NOACCESS &&
+                         (mbi.Protect & 0xFF) != PAGE_EXECUTE  &&
+                         !(mbi.Protect & PAGE_GUARD);
+        bool    noImg  = (mbi.Type    != MEM_IMAGE);
 
-        if (ok) {
-            scanned += sz;
-            uint8_t* p    = (uint8_t*)addr;
-            uint8_t* pEnd = p + sz - 3;
-            while (p < pEnd) {
+        if (commit && noExec && noImg && rSize >= 4) {
+            uintptr_t rBase = (uintptr_t)mbi.BaseAddress;
+            uintptr_t rEnd  = rBase + rSize;
+
+            // first page-aligned address at or after rBase
+            uintptr_t pg = (rBase + 0xFFF) & ~(uintptr_t)0xFFF;
+
+            while (pg + 4 <= rEnd) {
+                pagesChecked++;
                 __try {
-                    if (*(uint32_t*)p == VM_MAGIC && g_nPVMHits < 8) {
+                    if (*(uint32_t*)pg == UVM_MAGIC) {
                         hits++;
-                        LOG("[vascan] VM_MAGIC @ %p  region=%p  type=%s",
-                            p, mbi.AllocationBase,
+
+                        LOG("[uvmscan] UVM_MAGIC @ %p  region=%p  sz=0x%llX  type=%s",
+                            (void*)pg, mbi.AllocationBase,
+                            (unsigned long long)rSize,
                             mbi.Type == MEM_PRIVATE ? "PRIVATE" : "MAPPED");
-                        g_pvmHits[g_nPVMHits++].pvm = (PVM)p;
-                        p += 8;
-                    } else {
-                        p += 4;
+
+                        // Read PVM pointer at UVM+8  (from VMR3GetVM: mov rax,[rcx+8])
+                        PVM pvm = nullptr;
+                        bool readThrew = false;
+                        __try { pvm = *(PVM*)(pg + 8); }
+                        __except(EXCEPTION_EXECUTE_HANDLER) { readThrew = true; }
+                        LOG("[uvmscan]   UVM+8 (pVM ptr) = %p%s", pvm, readThrew ? " (read threw)" : "");
+
+                        // Also dump 48 bytes of struct so we can see the layout
+                        LOG("[uvmscan]   struct bytes +0:");
+                        __try {
+                            uint8_t* b = (uint8_t*)pg;
+                            for (int row = 0; row < 3; row++) {
+                                char hex[64]; char* out = hex;
+                                for (int col = 0; col < 16; col++)
+                                    out += sprintf_s(out, (size_t)(hex+sizeof(hex)-out),
+                                                     "%02X ", b[row*16+col]);
+                                LOG("[uvmscan]     +%02d: %s", row*16, hex);
+                            }
+                        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+                        // Test: call VMR3GetVM — should validate magic and return pVM
+                        PVM gotPVM = nullptr;
+                        bool getVMThrew = false;
+                        __try { gotPVM = g_fnGetVM((PUVM)pg); }
+                        __except(EXCEPTION_EXECUTE_HANDLER) { getVMThrew = true; }
+                        LOG("[uvmscan]   VMR3GetVM(pUVM)=%p%s%s",
+                            gotPVM, getVMThrew ? " (threw)" : "",
+                            (gotPVM && gotPVM == pvm) ? " *** MATCHES UVM+8 ***" : "");
+
+                        // Test: RangeCount with pUVM (probably fails: 0x19700823 > 30)
+                        uint32_t rcUVM = 0xDEAD;
+                        bool rcUVMThrew = false;
+                        __try { rcUVM = g_fnRangeCount((PUVM)pg); }
+                        __except(EXCEPTION_EXECUTE_HANDLER) { rcUVMThrew = true; }
+                        LOG("[uvmscan]   RangeCount(pUVM)=%u%s", rcUVM, rcUVMThrew?" THREW":"");
+
+                        // Test: RangeCount with pVM (cCpus check ≤ 30, should work)
+                        uint32_t rcPVM = 0xDEAD;
+                        bool rcPVMThrew = false;
+                        if (pvm && !readThrew) {
+                            __try { rcPVM = g_fnRangeCount((PUVM)pvm); }
+                            __except(EXCEPTION_EXECUTE_HANDLER) { rcPVMThrew = true; }
+                            LOG("[uvmscan]   RangeCount(pVM) =%u%s", rcPVM, rcPVMThrew?" THREW":"");
+                        }
+
+                        // Also test GetUVM(pVM) — should return back our pUVM
+                        PUVM gotUVM = nullptr;
+                        if (pvm && !readThrew) {
+                            __try { gotUVM = g_fnGetUVM(pvm); }
+                            __except(EXCEPTION_EXECUTE_HANDLER) {}
+                            LOG("[uvmscan]   VMR3GetUVM(pVM) =%p%s",
+                                gotUVM,
+                                (gotUVM == (PUVM)pg) ? " *** ROUND-TRIP OK ***" : "");
+                        }
+
+                        // Also test GetState with both handles
+                        unsigned stUVM = 0xDEAD, stPVM = 0xDEAD;
+                        __try { stUVM = g_fnGetState((PUVM)pg); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                        if (pvm && !readThrew) {
+                            __try { stPVM = g_fnGetState((PUVM)pvm); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+                        LOG("[uvmscan]   GetState(pUVM)=%u  GetState(pVM)=%u", stUVM, stPVM);
+
+                        // Pick range handle
+                        bool uvmOk = (rcUVM >= 1 && rcUVM <= 128);
+                        bool pvmOk = (rcPVM >= 1 && rcPVM <= 128);
+                        if (uvmOk || pvmOk) {
+                            LOG("[uvmscan]   *** WORKING RANGE HANDLE FOUND ***");
+                            result.pUVM        = (PUVM)pg;
+                            result.pVM         = pvm;
+                            result.rangeHandle = uvmOk ? (PUVM)pg : (PUVM)pvm;
+                            result.nRanges     = uvmOk ? rcUVM : rcPVM;
+                            result.valid       = true;
+                            // Keep scanning to log all hits, but stop after first valid
+                        }
                     }
-                } __except(EXCEPTION_EXECUTE_HANDLER) { p += 0x1000; }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+                pg += 0x1000;
             }
         }
 
-        addr += sz;
+        addr += rSize;
     }
 
-    LOG("[vascan] %.1f MB scanned, %llu VM_MAGIC hits",
-        scanned / (1024.0 * 1024.0), (unsigned long long)hits);
+    LOG("[uvmscan] scanned %llu page-aligned addresses, %llu UVM_MAGIC hits",
+        (unsigned long long)pagesChecked,
+        (unsigned long long)hits);
+
+    return result;
+}
+
+// ── range table dump ──────────────────────────────────────────────────────────
+
+static void DumpRangeTable(Handles* h)
+{
+    if (!h->valid || !h->rangeHandle) return;
+
+    LOG("[ranges] using handle=%p  nRanges=%u", h->rangeHandle, h->nRanges);
+    LOG("[ranges] %-4s  %-18s  %-18s  %-18s  %-10s  %s",
+        "idx", "GCPhysStart", "GCPhysEnd", "HCVirtStart", "size(MB)", "flags");
+
+    uint64_t totalGB = 0;
+    for (uint32_t i = 0; i < h->nRanges && i < 64; i++) {
+        PGMPHYSRANGEINFO info = {};
+        int rc = -1;
+        bool threw = false;
+        __try {
+            // 4-arg call: pass dwExtra=0
+            rc = g_fnGetRange(h->rangeHandle, i, 0, &info);
+        } __except(EXCEPTION_EXECUTE_HANDLER) { threw = true; }
+
+        if (threw) { LOG("[ranges]   [%2u] threw", i); continue; }
+        if (rc != VINF_SUCCESS) { LOG("[ranges]   [%2u] rc=%d", i, rc); continue; }
+
+        uint64_t sz = info.GCPhysEnd - info.GCPhysStart + 1;
+        totalGB += sz;
+
+        LOG("[ranges]   [%2u]  GC:%016llX-%016llX  HC:%016llX  %8.1f MB  %s",
+            i,
+            (unsigned long long)info.GCPhysStart,
+            (unsigned long long)info.GCPhysEnd,
+            (unsigned long long)info.HCPtrStart,
+            sz / (1024.0 * 1024.0),
+            info.fHasMapping ? "mapped" : "NO-HC-MAPPING");
+    }
+    LOG("[ranges] total guest RAM: %.1f MB", totalGB / (1024.0 * 1024.0));
+}
+
+// ── test read at GPA 0x0 ──────────────────────────────────────────────────────
+//
+// Read the first 16 bytes of guest physical address 0.
+// In a typical x86 VM, GPA 0 is the low BIOS / IVT area.
+// Any non-garbage result confirms the PVM and read path are correct.
+
+static void TestReadGPA0(Handles* h)
+{
+    if (!h->valid || !h->pVM) return;
+
+    LOG("[readtest] PGMPhysSimpleReadGCPhys(pVM=%p, GPA=0x0, cb=16)", h->pVM);
+
+    uint8_t buf[16] = {};
+    int rc = -1;
+    bool threw = false;
+    __try { rc = g_fnRead(h->pVM, buf, 0, sizeof(buf)); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { threw = true; }
+
+    if (threw) { LOG("[readtest] THREW"); return; }
+
+    char hex[64]; char* out = hex;
+    for (int i = 0; i < 16; i++) out += sprintf_s(out, 4, "%02X ", buf[i]);
+    LOG("[readtest] rc=%d  bytes: %s", rc, hex);
+
+    if (rc == VINF_SUCCESS)
+        LOG("[readtest] *** READ SUCCEEDED — PVM is confirmed correct ***");
+    else
+        LOG("[readtest] read failed (rc=%d)", rc);
+}
+
+// ── post-confirmation instructions ───────────────────────────────────────────
+//
+// Once range table is live, tell the user how to get the lane GPA via CE.
+
+static void PrintNextSteps(Handles* h)
+{
+    if (!h->valid) return;
+
+    LOG("=== NEXT STEPS TO FIND LANE GPA ===");
+    LOG("Range table is now live. The guest RAM HCPtrStart values above");
+    LOG("show where BlueStacks has mapped guest physical memory into the host process.");
+    LOG("");
+    LOG("To find the lane value GPA:");
+    LOG("  1. Leave the game running and open Cheat Engine attached to HD-Player.exe");
+    LOG("  2. Scan for the lane value (-1, 0, or 1) as int32");
+    LOG("  3. Navigate a lane; rescan for the new value; repeat until 1-4 addresses remain");
+    LOG("  4. Note the winning HVA (e.g. 0x2BDE7F7335C from the last session)");
+    LOG("  5. Run the new bot DLL with that HVA — it will:");
+    LOG("       for each range i in the table:");
+    LOG("         if HVA in [HCPtrStart, HCPtrStart + rangeSize):");
+    LOG("           GPA = GCPhysStart + (HVA - HCPtrStart)");
+    LOG("           print GPA — this is the stable lane address across restarts");
+    LOG("");
+    LOG("Or: paste those HCPtrStart values and ask for the bot DLL directly.");
+    LOG("    The bot will scan guest RAM for the lane value at boot without needing CE.");
 }
 
 // ── main thread ───────────────────────────────────────────────────────────────
@@ -491,7 +341,7 @@ static DWORD WINAPI ReconThread(LPVOID)
     g_log = fopen(LOG_PATH, "w");
     if (!g_log) { OutputDebugStringA("[recon] log open failed\n"); return 0; }
 
-    LOG("[recon] v3  pid=%u", GetCurrentProcessId());
+    LOG("[recon] v4  pid=%u", GetCurrentProcessId());
 
     HMODULE hVMM = GetModuleHandleA("BstkVMM.dll");
     if (!hVMM) { LOG("[recon] BstkVMM.dll not loaded"); goto done; }
@@ -515,41 +365,32 @@ static DWORD WINAPI ReconThread(LPVOID)
         RESOLVE(PGMPhysSimpleWriteGCPhys,  pfnPGMPhysSimpleWriteGCPhys,  g_fnWrite)
 #undef RESOLVE
 
-        // ── 1. function byte dumps ────────────────────────────────────────────
-        LOG("=== FUNCTION BYTES ===");
-        DumpFuncBytes("VMR3GetUVM",                g_fnGetUVM);
-        DumpFuncBytes("VMR3GetVM",                 g_fnGetVM);
-        DumpFuncBytes("VMR3GetState",              g_fnGetState);
-        DumpFuncBytes("PGMR3PhysGetRamRangeCount", g_fnRangeCount);
-        DumpFuncBytes("PGMR3PhysGetRange",         g_fnGetRange);
-        DumpFuncBytes("PGMPhysSimpleReadGCPhys",   g_fnRead);
-        DumpFuncBytes("PGMPhysSimpleWriteGCPhys",  g_fnWrite);
+        // ── scan for real UVM ─────────────────────────────────────────────────
+        LOG("=== UVM SCAN (magic=0x%08X, page-aligned only) ===", UVM_MAGIC);
+        Handles h = ScanForUVM();
 
-        // ── 2. null-arg test ──────────────────────────────────────────────────
-        LOG("=== NULL ARG TEST ===");
-        NullArgTest();
+        LOG("=== SELECTION ===");
+        LOG("[select] valid=%s  pUVM=%p  pVM=%p  rangeHandle=%p  nRanges=%u",
+            h.valid ? "YES" : "NO",
+            h.pUVM, h.pVM, h.rangeHandle, h.nRanges);
 
-        // ── 3. query TARGET_HVA region ────────────────────────────────────────
-        LOG("=== TARGET HVA REGION ===");
-        QueryTargetHVA();
-
-        // ── 4. VA scan + struct walk ──────────────────────────────────────────
-        LOG("=== VA SCAN + STRUCT WALK ===");
-        CollectPVMHits();
-
-        uintptr_t estimatedGPA = (g_guestRAMBase && TARGET_HVA >= g_guestRAMBase)
-                                 ? (TARGET_HVA - g_guestRAMBase)
-                                 : 0;
-        LOG("[recon] estimated GPA for struct walk reads: 0x%016llX", (unsigned long long)estimatedGPA);
-
-        for (int i = 0; i < g_nPVMHits; i++) {
-            LOG("--- PVM hit %d ---", i + 1);
-            WalkPVMStruct(g_pvmHits[i].pvm, estimatedGPA);
+        if (!h.valid) {
+            LOG("[recon] no valid UVM found");
+            LOG("[recon] if zero UVM_MAGIC hits: BlueStacks may have changed the magic again;");
+            LOG("[recon] disassemble VMR3GetVM at %p for the cmp immediate", (void*)g_fnGetVM);
+            goto done;
         }
 
-        // ── 5. scan for HCPtr in guest RAM region ─────────────────────────────
-        LOG("=== HCPTR SCAN ===");
-        ScanForHCPtr();
+        // ── range table ───────────────────────────────────────────────────────
+        LOG("=== RANGE TABLE ===");
+        DumpRangeTable(&h);
+
+        // ── GPA 0 test read ───────────────────────────────────────────────────
+        LOG("=== GPA 0x0 TEST READ ===");
+        TestReadGPA0(&h);
+
+        // ── next steps ────────────────────────────────────────────────────────
+        PrintNextSteps(&h);
 
         LOG("[recon] done.");
     }
