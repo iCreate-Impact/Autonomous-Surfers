@@ -1,351 +1,315 @@
 #!/usr/bin/env python3
 """
-extract_offsets.py v11
+extract_offsets.py v12
 
-New since v10:
-  · Brute-force scan of ALL 117,148 field defs for "lane" (case-insensitive)
-  · Reverse abs_fi → typedef map so each hit knows its owning class
-  · CharacterMotor: dump all 136 fields (not just first 15)
-  · CIC parent chain: probe pair[20] Il2CppType[] at entry_sz 8 and 12
-  · ELF .dynsym / .symtab: il2cpp_field_* exports + any g_FieldOffset data symbols
-  · Fallback: if no lane hit, dump SYBO-namespace fields containing
-    "current" / "index" / "col" / "track" / "dir"  (capped at 60 lines)
+Three investigations:
 
-Confirmed from v10:
-  pair[ 2] = string table        str_off=0x0cd54c
-  pair[10] = Il2CppFieldDef[]    fdef_off=0x928550  entry_size=12  n=117148
-  pair[11] = candidate foff      foff_off=0xa7f8a0
-  pair[19] = Il2CppTypeDef[]     type_off=0xc86d68  TD_SIZE=88  n=20393
-  pair[20] = Il2CppType[]        probed below (entry_sz 8 or 12)
-  FS_OFF=32 · FC_OFF=64 · PARENT_OFF=20  — correct (CharacterMotor verifies)
-  12-byte fieldDef layout: nameIdx(4) | typeRef_or_caIdx(4) | typeIdx_or_token(4)
-  CIC: field_start=0xFFFFFFFF sentinel · field_count=3 · parent_tidx=23106 TypeIndex
-  Field offsets are NOT in v31 metadata.
-  At boot-time use: il2cpp_class_get_fields() + il2cpp_field_get_offset()
+  1. FS_OFF PROBE — exhaustive (fs_off, fc_off, fc_width) search over all 20,393
+     typedefs to find any combo that maps a typedef to lane abs_fi targets
+     {735, 780, 781, 3004, 3047, 3831}.  If nothing covers 3004/3047, those
+     fields belong to classes with genuinely-sentinel FS regardless of offset.
+
+  2. RAW TYPEDEF DUMP — print all 22 uint32 slots (88 bytes) for:
+       · CharacterMotor (td[214]) — our verified reference
+       · CharacterInputController (td[199])
+       · Every typedef between them (td[196..215]) — multi-column summary
+     This shows exactly which slot holds fieldStart / fieldCount for each type.
+
+  3. PAIR TABLE SCAN — print ALL pairs [0..35] with sizes/entry-counts.
+     pair[20] has only 845 entries; parent TypeIndex 23106/23113 need a table
+     with >= 23114 entries.  Also probe each candidate pair entry for CIC/Motor
+     parent_tidx (23106 / 23113) to confirm the right Il2CppType[] layout.
+
+  4. FULL il2cpp_ DYNSYM — all 241 exported il2cpp_* symbols with vaddrs so we
+     know exactly which API the C++ resolver can call.
+
+Confirmed from v11:
+  pair[2]=str  pair[10]=fdef(12B)  pair[11]=foff  pair[19]=typedef(88B n=20393)
+  FS_OFF=32 · FC_OFF=64 — correct for CharacterMotor (fs=4055 fc=136 verified)
+  laneIndex (abs_fi=3047) w1=0x08000bea w2=0x773b — no owner in reverse map
+  currentLane (abs_fi=3004) w1=0x08000bbf w2=0x7723 — no owner in reverse map
+  CIC td[199]: fs=SENTINEL fc=3 pt=23106
+  Motor td[214]: fs=4055 fc=136 pt=23113
 
 Usage: py -3 extract_offsets.py base.apk
-Out:   lane_hits.json
+Out:   probe_results.json
 """
 
-import sys, zipfile, struct, json
+import sys, zipfile, struct, json, collections
 
 APK = sys.argv[1] if len(sys.argv) > 1 else "base.apk"
-OUT = "lane_hits.json"
+OUT = "probe_results.json"
 
-LANE_KW     = ["lane"]
-FALLBACK_KW = ["current", "index", "col", "track", "dir"]
+LANE_TARGETS = {735: 'laneOffset', 780: 'laneDir_a', 781: 'laneDir_b',
+                3004: 'currentLane', 3047: 'laneIndex', 3831: 'laneDir_c'}
 
-STR_PI  = 2;  FDEF_PI = 10; FOFF_PI = 11
-TYPE_PI = 19; ITYPE_PI = 20
+STR_PI = 2; FDEF_PI = 10; FOFF_PI = 11; TYPE_PI = 19
 
-TD_SIZE = 88; FS_OFF = 32; FC_OFF = 64; PARENT_OFF = 20
-FD_SIZE = 12; SENTINEL = 0xFFFF_FFFF
-
-IL2CPP_CLASS = 0x11; IL2CPP_VT = 0x12
+TD_SIZE = 88; FD_SIZE = 12; SENTINEL = 0xFFFF_FFFF
 
 # ── load ──────────────────────────────────────────────────────────────────────
 print(f"[*] opening {APK}")
 with zipfile.ZipFile(APK) as z:
-    ns   = z.namelist()
-    lib  = z.read(next(n for n in ns if n.endswith("arm64-v8a/libil2cpp.so")))
-    meta = z.read(next(n for n in ns if n.endswith("global-metadata.dat")))
+    names = z.namelist()
+    lib   = z.read(next(n for n in names if n.endswith("arm64-v8a/libil2cpp.so")))
+    meta  = z.read(next(n for n in names if n.endswith("global-metadata.dat")))
 
 magic, ver = struct.unpack_from("<II", meta, 0)
-assert magic == 0xFAB11BAF, f"bad magic {magic:#010x}"
+assert magic == 0xFAB11BAF
 print(f"[*] metadata v{ver}  lib={len(lib):,}B  meta={len(meta):,}B")
 
 def _pair(i): return struct.unpack_from("<II", meta, 8 + i * 8)
 
-str_off,   str_sz   = _pair(STR_PI)
-type_off,  type_sz  = _pair(TYPE_PI)
-fdef_off,  fdef_sz  = _pair(FDEF_PI)
-foff_off,  foff_sz  = _pair(FOFF_PI)
-itype_off, itype_sz = _pair(ITYPE_PI)
-
-n_types = type_sz  // TD_SIZE
-n_fdefs = fdef_sz  // FD_SIZE
+str_off,  str_sz  = _pair(STR_PI)
+type_off, type_sz = _pair(TYPE_PI)
+n_types = type_sz // TD_SIZE
+n_fdefs = _pair(FDEF_PI)[1] // FD_SIZE
 print(f"[*] n_types={n_types}  n_fdefs={n_fdefs}")
-print(f"[*] pair[20] off={itype_off:#x}  sz={itype_sz:#x}  "
-      f"/8={itype_sz//8}  /12={itype_sz//12}")
 
-# string table cached slice — index() on a slice is much faster than on full meta
-_STR = meta[str_off:str_off + str_sz]
-
+STR = meta[str_off:str_off + str_sz]
 def cstr(r):
-    if r >= str_sz:
-        return f"<OOB:{r:#x}>"
-    try:
-        e = _STR.index(b'\x00', r)
-        return _STR[r:e].decode('utf-8', 'replace')
-    except ValueError:
-        return _STR[r:].decode('utf-8', 'replace')
+    if r >= str_sz: return f"<OOB:{r:#x}>"
+    try: e = STR.index(b'\x00', r); return STR[r:e].decode('utf-8','replace')
+    except ValueError: return STR[r:].decode('utf-8','replace')
 
-# ── typedef table ─────────────────────────────────────────────────────────────
-print("[*] building typedef table...")
-tdefs = []
-for i in range(n_types):
+def td_full_name(i):
+    if not (0 <= i < n_types): return f"<OOB:{i}>"
     b = type_off + i * TD_SIZE
-    try:
-        ni, nsi = struct.unpack_from("<II", meta, b)
-        fs,     = struct.unpack_from("<I",  meta, b + FS_OFF)
-        fc,     = struct.unpack_from("<H",  meta, b + FC_OFF)
-        pt,     = struct.unpack_from("<i",  meta, b + PARENT_OFF)
-        tdefs.append({'i': i, 'name': cstr(ni), 'ns': cstr(nsi),
-                      'fs': fs, 'fc': fc, 'pt': pt})
-    except Exception:
-        tdefs.append(None)
+    ni, nsi = struct.unpack_from("<II", meta, b)
+    return f"{cstr(nsi)}.{cstr(ni)}"
 
-def _find(name, ns):
-    return next((t for t in tdefs if t and t['name'] == name and t['ns'] == ns), None)
-
-cic   = _find('CharacterInputController', 'SYBO.RunnerCore.Character')
-motor = _find('CharacterMotor',           'SYBO.RunnerCore.Character')
-print(f"[*] CIC   : {cic}")
-print(f"[*] Motor : {motor}")
-
-# ── CIC parent chain via pair[20] ─────────────────────────────────────────────
-# Il2CppType: data(uint32) | attrs(uint16) | type_enum(uint8) | bitfield(uint8)
-# If type_enum in {0x11 CLASS, 0x12 VALUETYPE}: data = TypeDefinitionIndex
-print(f"\n[*] CIC parent chain (TypeIndex={cic['pt'] if cic else '?'}):")
-if cic:
-    ptidx = cic['pt']
-    for esz in (8, 12):
-        n_it = itype_sz // esz
-        sys.stdout.write(f"  esz={esz}  n_entries={n_it}  ")
-        if not (0 <= ptidx < n_it):
-            print("OOB"); continue
-        b = itype_off + ptidx * esz
-        data, attrs, te = struct.unpack_from("<IHB", meta, b)
-        sys.stdout.write(f"data={data:#x}  attrs={attrs:#x}  te={te:#04x}  ")
-        if te in (IL2CPP_CLASS, IL2CPP_VT):
-            if 0 <= data < len(tdefs) and tdefs[data]:
-                p = tdefs[data]
-                print(f"→ '{p['ns']}.{p['name']}'  "
-                      f"fs={p['fs']}  fc={p['fc']}  typedef_idx={p['i']}")
-            else:
-                print(f"→ typedef_idx={data} OOB or null")
-        else:
-            print("→ not CLASS/VALUETYPE — probably wrong esz")
-
-# ── reverse map: abs_fi → typedef ─────────────────────────────────────────────
-print("\n[*] building reverse field → typedef map...")
-f2t = {}
-for td in tdefs:
-    if not td or td['fs'] == SENTINEL or td['fc'] == 0:
-        continue
-    for i in range(td['fc']):
-        fi = td['fs'] + i
-        if fi < n_fdefs:
-            f2t[fi] = td
-print(f"[*] mapped {len(f2t)} entries  "
-      f"({n_fdefs - len(f2t)} fields belong to sentinel-start classes)")
-
-def _p11(abs_fi):
-    off = abs_fi * 4
-    if off + 4 <= foff_sz:
-        return struct.unpack_from("<I", meta, foff_off + off)[0]
-    return None
-
-# ── brute-force lane scan ─────────────────────────────────────────────────────
+# ── 1. FS_OFF PROBE ───────────────────────────────────────────────────────────
 print(f"\n{'='*70}")
-print(f"[*] BRUTE FORCE: {n_fdefs} field defs — keywords={LANE_KW!r} (case-insensitive)")
+print("[*] FS_OFF PROBE: searching all (fs_off, fc_off, fc_width) for typedefs")
+print(f"    covering lane targets: {sorted(LANE_TARGETS)}")
+print("    fc > 20000 excluded as noise")
+print()
 
-lane_hits = []
-for abs_fi in range(n_fdefs):
-    b = fdef_off + abs_fi * FD_SIZE
-    if b + FD_SIZE > len(meta):
-        print(f"  [!] OOB at abs_fi={abs_fi}"); break
-    ni, w1, w2 = struct.unpack_from("<III", meta, b)
-    if ni >= str_sz:
-        continue
-    nm = cstr(ni)
-    if not any(k in nm.lower() for k in LANE_KW):
-        continue
+# offsets to try
+FS_CANDS = range(28, 56, 4)   # 28, 32, 36, 40, 44, 48, 52
+FC_CANDS = [(56,'H'),(60,'H'),(64,'H'),(68,'H'),(72,'H'),(76,'H'),
+            (60,'I'),(64,'I'),(68,'I')]
 
-    td  = f2t.get(abs_fi)
-    p11 = _p11(abs_fi)
-    h   = dict(abs_fi=abs_fi, name=nm,
-               cls=td['name'] if td else None,
-               ns =td['ns']   if td else None,
-               ti =td['i']    if td else -1,
-               w1=w1, w2=w2, p11=p11)
-    lane_hits.append(h)
+# build a quick raw slot table for all typedefs to avoid re-reading meta
+# store slots 7..13 (offsets 28..52) as uint32 and slots 14..20 as uint16
+# for speed, pre-read relevant byte ranges
 
-    cln = f"{td['ns']}.{td['name']}" if td else "(no owner — class has sentinel field_start)"
-    print(f"  [{abs_fi:6d}] '{nm}'")
-    print(f"           {cln}  typedef_idx={h['ti']}")
-    print(f"           w1={w1:#010x}  w2={w2:#010x}", end="")
-    if p11 is not None:
-        print(f"  p11={p11:#010x}", end="")
-    print()
+# Fast inner loop: pre-slice the typedef table
+td_data = meta[type_off:type_off + n_types * TD_SIZE]
 
-if not lane_hits:
-    print("  *** no 'lane' hits — running fallback scan for SYBO-namespace fields ***")
-    printed = 0
-    for abs_fi in range(n_fdefs):
-        if printed >= 60:
-            print("  ... (capped at 60 lines)"); break
-        b = fdef_off + abs_fi * FD_SIZE
-        if b + FD_SIZE > len(meta): break
-        ni, w1, w2 = struct.unpack_from("<III", meta, b)
-        if ni >= str_sz: continue
-        nm = cstr(ni)
-        if not any(k in nm.lower() for k in FALLBACK_KW): continue
-        td = f2t.get(abs_fi)
-        if not td: continue
-        ns = td['ns']
-        if 'SYBO' not in ns and 'Runner' not in ns: continue
-        print(f"  [{abs_fi:6d}] {nm:<42} {ns}.{td['name']}"
-              f"  w2={w2:#010x}")
-        printed += 1
+def td_u32(i, off): return struct.unpack_from("<I", td_data, i*TD_SIZE + off)[0]
+def td_u16(i, off): return struct.unpack_from("<H", td_data, i*TD_SIZE + off)[0]
 
-# ── CharacterMotor: ALL fields ────────────────────────────────────────────────
-print(f"\n{'='*70}")
-if motor and motor['fs'] != SENTINEL:
-    fs, fc = motor['fs'], motor['fc']
-    print(f"[*] CharacterMotor ALL {fc} fields (field_start={fs}):")
-    for fi in range(fc):
-        abs_fi = fs + fi
-        b = fdef_off + abs_fi * FD_SIZE
-        try:
-            ni, w1, w2 = struct.unpack_from("<III", meta, b)
-            nm = cstr(ni) if ni < str_sz else f"<OOB:{ni:#x}>"
-        except:
-            nm, w1, w2 = "<err>", 0, 0
-        p11  = _p11(abs_fi)
-        mark = " ◄ LANE" if any(k in nm.lower() for k in LANE_KW) else ""
-        p11s = f"  p11={p11:#010x}" if p11 is not None else ""
-        print(f"  [{abs_fi:5d}/{fi:3d}] {nm:<40} | "
-              f"w1={w1:#010x}  w2={w2:#010x}{p11s}{mark}")
+probe_hits = collections.defaultdict(list)  # key → list of (target, td_idx, fs, fc)
+
+for fs_off in FS_CANDS:
+    for fc_off, fc_fmt in FC_CANDS:
+        for i in range(n_types):
+            fs = td_u32(i, fs_off)
+            if fs == SENTINEL or fs > 150000: continue
+            fc = (td_u16(i, fc_off) if fc_fmt == 'H' else td_u32(i, fc_off))
+            if fc == 0 or fc > 20000: continue
+            for target in LANE_TARGETS:
+                if fs <= target < fs + fc:
+                    probe_hits[(fs_off, fc_off, fc_fmt)].append((target, i, fs, fc))
+
+if not probe_hits:
+    print("  *** NO COMBINATION FOUND ***")
+    print("  Those fields truly belong to classes with sentinel at every")
+    print("  candidate fieldStart offset.  See raw typedef dump below for")
+    print("  manual inspection of CIC's raw slots.")
 else:
-    print("[*] CharacterMotor: sentinel field_start or not found — skipping")
+    important = {k: v for k, v in probe_hits.items()
+                 if any(h[0] in (3004, 3047) for h in v)}
+    all_keys = sorted(important) if important else sorted(probe_hits)
+    for key in all_keys:
+        fs_off, fc_off, fc_fmt = key
+        hits = probe_hits[key]
+        targets_hit = sorted({h[0] for h in hits})
+        marker = "  ◄ LANE INDEX" if 3047 in targets_hit else ""
+        print(f"  FS_OFF={fs_off}  FC_OFF={fc_off}({fc_fmt})"
+              f"  → covers abs_fi={targets_hit}{marker}")
+        for target, td_idx, fs, fc in sorted(hits):
+            print(f"    abs_fi={target:5d} ({LANE_TARGETS[target]:<12})  "
+                  f"typedef[{td_idx:5d}] '{td_full_name(td_idx)}'  "
+                  f"fs={fs}  fc={fc}")
+        print()
 
-# ── ELF scan ──────────────────────────────────────────────────────────────────
+print(f"[*] checked {len(FS_CANDS)*len(FC_CANDS)} offset combos × {n_types} typedefs")
+
+# ── 2. RAW TYPEDEF DUMP ───────────────────────────────────────────────────────
 print(f"\n{'='*70}")
-print("[*] ELF symbol scan (libil2cpp.so)...")
+print("[*] RAW TYPEDEF DUMP")
+print("    Slot layout (each slot = 4 bytes):")
+print("    [0]nameIdx [1]nsIdx [2]byvalTI [3]byrefTI [4]declaringTI [5]parentTI")
+print("    [6]elemTI [7]genContainerIdx [8]??? [9]??? [10]??? [11]??? ...")
+print("    FC_OFF=64 → slot 16;  FS_OFF=32 → slot 8;  PARENT_OFF=20 → slot 5")
 
-def elf_scan(data):
-    if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
-        print("  not ARM64 ELF64 LE"); return []
+for label, td_idx in [("CharacterMotor (reference)", 214), ("CIC", 199)]:
+    slots = [td_u32(td_idx, k*4) for k in range(22)]
+    print(f"\n  typedef[{td_idx}] {label}:")
+    print(f"  fullname: {td_full_name(td_idx)}")
+    for k in range(0, 22, 4):
+        row = slots[k:k+4]
+        hexs = "  ".join(f"[{k+j:2d}]{v:#010x}" for j,v in enumerate(row))
+        print(f"    {hexs}")
+    # specifically call out slots that differ between the two
+    print(f"  → slot[8]={slots[8]}  slot[9]={slots[9]}  slot[10]={slots[10]}")
+    print(f"  → slot[14]={slots[14]}  slot[15]={slots[15]}  slot[16]={slots[16]}")
+    print(f"  → slot[17]={slots[17]}  slot[18]={slots[18]}")
 
-    # ELF64 header fields starting at byte 16
+# typedefs 196–215: multi-column summary showing key slot offsets
+print(f"\n  Typedefs 196–215 — multi-offset comparison (uint32 @28,32,36; uint16 @60,64,68,72):")
+header = (f"  {'idx':>4}  "
+          f"{'@28':>10}  {'@32':>10}  {'@36':>10}  "
+          f"{'fc@60':>6}  {'fc@64':>6}  {'fc@68':>6}  {'fc@72':>6}  "
+          f"name")
+print(header)
+print("  " + "-"*120)
+for td_idx in range(196, 216):
+    if td_idx * TD_SIZE + TD_SIZE > len(td_data): break
+    v28, v32, v36  = td_u32(td_idx, 28), td_u32(td_idx, 32), td_u32(td_idx, 36)
+    f60, f64, f68, f72 = (td_u16(td_idx, o) for o in (60, 64, 68, 72))
+    name = td_full_name(td_idx)
+    # mark CIC and Motor
+    mark = " ◄" if td_idx in (199, 214) else ""
+    # flag any slot that looks like it could be fieldStart covering 3047
+    fs_flag = ""
+    for v in (v28, v32, v36):
+        if v != SENTINEL and 2000 <= v <= 3047:
+            fs_flag = f"  ** @28/32/36={v} near 3047"
+    print(f"  [{td_idx:4d}]{mark}  "
+          f"{v28:#010x}  {v32:#010x}  {v36:#010x}  "
+          f"{f60:6d}  {f64:6d}  {f68:6d}  {f72:6d}  "
+          f"{name[:50]}{fs_flag}")
+
+# also dump raw slots for typedefs that contain each lane field (from reverse-map hits)
+# i.e. typedefs whose FS_OFF=32 field_start + fc covers our targets but maybe with wrong fc
+print(f"\n  Additional: check raw slots for any typedef where slot[8] (FS_OFF=32)")
+print(f"  is in range [2000, 4055) — might have wrong fc at FC_OFF=64:")
+for td_idx in range(n_types):
+    fs = td_u32(td_idx, 32)   # slot 8
+    if 2000 <= fs < 4055:
+        fc_at_64 = td_u16(td_idx, 64)
+        fc_at_68 = td_u16(td_idx, 68)
+        fc_at_72 = td_u16(td_idx, 72)
+        for target in (3004, 3047):
+            if fc_at_64 > 0 and fs <= target < fs + fc_at_64: continue  # already in probe
+        # print if fc@64 is 0 or unreasonably small
+        if fc_at_64 < 10:
+            print(f"    td[{td_idx:5d}] fs@32={fs:6d}  fc@64={fc_at_64:5d}  "
+                  f"fc@68={fc_at_68:5d}  fc@72={fc_at_72:5d}  {td_full_name(td_idx)}")
+
+# ── 3. PAIR TABLE SCAN ────────────────────────────────────────────────────────
+print(f"\n{'='*70}")
+print("[*] PAIR TABLE [0..35]")
+print("    CIC parent_tidx=23106  Motor parent_tidx=23113")
+print("    Need a table with >= 23114 entries of 8B = 184,912B  or 12B = 277,368B")
+print()
+
+PARENT_TIDXS = {23106: 'CIC_parent', 23113: 'Motor_parent'}
+IL2CPP_CLASS = 0x11; IL2CPP_VT = 0x12
+
+for pi in range(36):
+    off, sz = _pair(pi)
+    if off == 0 and sz == 0: continue
+    flags = []
+    n8  = sz // 8
+    n12 = sz // 12
+    n4  = sz // 4
+    if n8  >= 23114: flags.append("← Il2CppType[] esz=8 candidate")
+    if n12 >= 23114 and not flags: flags.append("← Il2CppType[] esz=12 candidate")
+
+    # probe parent_tidx entries if size allows
+    extra = []
+    for tidx, label in PARENT_TIDXS.items():
+        for esz in (8, 12):
+            n = sz // esz
+            if tidx >= n: continue
+            b = off + tidx * esz
+            if b + 8 > len(meta): continue
+            data_val, attrs, te = struct.unpack_from("<IHB", meta, b)
+            if te in (IL2CPP_CLASS, IL2CPP_VT):
+                extra.append(f"  entry[{tidx}]({label}) esz={esz}: "
+                              f"data={data_val:#x} te={te:#04x} attrs={attrs:#x}")
+
+    flag_str = "  " + "  ".join(flags) if flags else ""
+    print(f"  pair[{pi:2d}]: off={off:#010x}  sz={sz:#010x}  "
+          f"/4={n4:7d}  /8={n8:7d}  /12={n12:7d}{flag_str}")
+    for e in extra:
+        print(f"           {e}")
+
+# ── 4. FULL il2cpp_ DYNSYM DUMP ───────────────────────────────────────────────
+print(f"\n{'='*70}")
+print("[*] FULL il2cpp_ DYNSYM DUMP")
+
+def parse_dynsym(data):
+    if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1: return []
     (etype, emach, ever, eentry, ephoff, eshoff,
      eflags, eehsz, ephentsz, ephnum,
      eshentsz, eshnum, eshstrndx) = struct.unpack_from("<HHIQQQIHHHHHH", data, 16)
-
-    print(f"  e_machine={emach:#x} (0xb7=AArch64)  "
-          f"e_shoff={eshoff:#x}  e_shnum={eshnum}  "
-          f"e_shentsize={eshentsz}  e_shstrndx={eshstrndx}")
-
-    if not eshoff or not eshnum:
-        print("  no section header table"); return []
-    if eshentsz != 64:
-        print(f"  unexpected e_shentsize={eshentsz} (expected 64)"); return []
-    if not (0 < eshstrndx < eshnum):
-        print(f"  bad e_shstrndx={eshstrndx}"); return []
-
-    def _shdr_base(i): return eshoff + i * 64
-
-    # section name string table
-    shstr_off, shstr_sz = struct.unpack_from("<QQ", data, _shdr_base(eshstrndx) + 24)
-    shstrtab = data[shstr_off:shstr_off + shstr_sz]
-
-    SHT_SYMTAB = 2; SHT_DYNSYM = 11
-    sym_secs = []
+    if not eshoff or not eshnum or eshentsz != 64: return []
+    if not (0 < eshstrndx < eshnum): return []
+    def _shdr(i): return eshoff + i * 64
+    shstr_off, shstr_sz = struct.unpack_from("<QQ", data, _shdr(eshstrndx)+24)
+    shstrtab = data[shstr_off:shstr_off+shstr_sz]
+    SHT_DYNSYM = 11
     for i in range(eshnum):
-        sb = _shdr_base(i)
-        sh_name, sh_type = struct.unpack_from("<II",  data, sb)
-        sh_off,  sh_sz   = struct.unpack_from("<QQ",  data, sb + 24)
-        sh_link,         = struct.unpack_from("<I",   data, sb + 40)
-        sh_entsize,      = struct.unpack_from("<Q",   data, sb + 56)
-        if sh_type not in (SHT_SYMTAB, SHT_DYNSYM): continue
-        label = "DYNSYM" if sh_type == SHT_DYNSYM else "SYMTAB"
-        print(f"  section[{i}] .{label}  "
-              f"off={sh_off:#x}  sz={sh_sz:#x}  "
-              f"entsize={sh_entsize}  strtab_link={sh_link}")
-        sym_secs.append((label, sh_off, sh_sz, sh_link, sh_entsize))
-
-    if not sym_secs:
-        print("  no symbol tables — binary is stripped"); return []
-
-    all_hits = []
-    for label, sym_off, sym_sz, str_link, entsize in sym_secs:
-        strtab_off, strtab_sz = struct.unpack_from("<QQ",
-                                    data, _shdr_base(str_link) + 24)
-        strtab = data[strtab_off:strtab_off + strtab_sz]
-        n_syms = sym_sz // entsize
-        print(f"\n  {label}: {n_syms} symbols")
-
-        api_hits  = []   # il2cpp_field_*
-        data_hits = []   # g_FieldOffset*
-        il2cpp_total = 0
-
-        for si in range(n_syms):
-            sb = sym_off + si * entsize
-            # ELF64 Sym: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8)
-            st_name,            = struct.unpack_from("<I", data, sb)
-            st_value, st_size   = struct.unpack_from("<QQ", data, sb + 8)
+        sh_name, sh_type = struct.unpack_from("<II", data, _shdr(i))
+        if sh_type != SHT_DYNSYM: continue
+        sh_off, sh_sz  = struct.unpack_from("<QQ", data, _shdr(i)+24)
+        sh_link,       = struct.unpack_from("<I",  data, _shdr(i)+40)
+        sh_entsize,    = struct.unpack_from("<Q",  data, _shdr(i)+56)
+        strtab_off, strtab_sz = struct.unpack_from("<QQ", data, _shdr(sh_link)+24)
+        strtab = data[strtab_off:strtab_off+strtab_sz]
+        syms = []
+        for si in range(sh_sz // sh_entsize):
+            sb = sh_off + si * sh_entsize
+            st_name, = struct.unpack_from("<I", data, sb)
+            st_value, = struct.unpack_from("<Q", data, sb + 8)
+            st_size,  = struct.unpack_from("<Q", data, sb + 16)
             try:
-                end = strtab.index(b'\x00', st_name)
-                sn = strtab[st_name:end].decode('utf-8', 'replace')
-            except Exception: continue
+                e = strtab.index(b'\x00', st_name)
+                sn = strtab[st_name:e].decode('utf-8','replace')
+            except: continue
+            if sn.startswith('il2cpp_'): syms.append((sn, st_value, st_size))
+        return syms
+    return []
 
-            if sn.startswith('il2cpp_'): il2cpp_total += 1
-            if 'FieldOffset' in sn or 'g_FieldOffset' in sn:
-                data_hits.append((sn, st_value, st_size))
-            elif 'il2cpp_field' in sn.lower():
-                api_hits.append((sn, st_value))
+syms = parse_dynsym(lib)
+syms.sort(key=lambda x: x[0])
+print(f"  total il2cpp_ exports: {len(syms)}")
+print()
 
-        print(f"  total il2cpp_ exports : {il2cpp_total}")
+# print in columns, grouping by subsystem (il2cpp_domain_, il2cpp_class_, etc.)
+GROUPS = ['domain','assembly','image','class','field','method','type','thread',
+          'gc','object','value','array','string','monitor','alloc','mem']
+grouped = collections.defaultdict(list)
+for name, addr, sz in syms:
+    placed = False
+    for g in GROUPS:
+        if f'il2cpp_{g}_' in name or name == f'il2cpp_{g}':
+            grouped[g].append((name, addr))
+            placed = True; break
+    if not placed:
+        grouped['other'].append((name, addr))
 
-        if data_hits:
-            print(f"  DATA (FieldOffset symbols):")
-            for n, v, sz in data_hits:
-                print(f"    {n:<60} @ {v:#018x}  sz={sz}")
-                all_hits.append({'kind': 'data', 'name': n, 'addr': v, 'size': sz})
-        else:
-            print("  (no g_FieldOffset data symbols — table is internal / not exported)")
-
-        if api_hits:
-            print(f"  il2cpp_field_* exports ({len(api_hits)}):")
-            for n, v in api_hits:
-                print(f"    {n:<60} @ {v:#018x}")
-                all_hits.append({'kind': 'api', 'name': n, 'addr': v})
-        else:
-            print("  (no il2cpp_field_* exports — "
-                  "field offset must come from il2cpp_class_get_fields loop)")
-
-    return all_hits
-
-elf_hits = elf_scan(lib)
+for grp in GROUPS + ['other']:
+    if grp not in grouped: continue
+    print(f"  — {grp} ({len(grouped[grp])}) —")
+    for name, addr in grouped[grp]:
+        print(f"    {name:<52} {addr:#018x}")
+    print()
 
 # ── save ──────────────────────────────────────────────────────────────────────
 result = {
-    'metadata_version': ver,
-    'n_types': n_types,
-    'n_fdefs': n_fdefs,
-    'cic':     cic,
-    'motor':   motor,
-    'lane_hits':  lane_hits,
-    'elf_hits':   elf_hits,
+    'probe_hits_covering_3047': [
+        {'key': str(k), 'hits': [{'abs_fi':h[0],'td_idx':h[1],'fs':h[2],'fc':h[3]}
+                                   for h in v]}
+        for k, v in probe_hits.items()
+        if any(h[0] in (3004, 3047) for h in v)
+    ],
+    'il2cpp_exports': [{'name': n, 'addr': a} for n, a, _ in syms],
 }
-with open(OUT, 'w') as f:
-    json.dump(result, f, indent=2)
-
-print(f"\n{'='*70}")
-print(f"[*] SUMMARY  →  {OUT}")
-print(f"    lane_hits  : {len(lane_hits)}")
-for h in lane_hits:
-    print(f"      abs_fi={h['abs_fi']}  '{h['name']}'  "
-          f"{h['ns']}.{h['cls']}  typedef_idx={h['ti']}")
-print(f"    elf_hits   : {len(elf_hits)}")
-print()
-if lane_hits:
-    print("    Next: use abs_fi in the injected DLL —")
-    print("      il2cpp_class_get_fields(klass, &iter) to walk fields")
-    print("      il2cpp_field_get_name(fi) to match by name")
-    print("      il2cpp_field_get_offset(fi) for the runtime object offset")
-else:
-    print("    No lane field found — check the fallback output above.")
-    print("    Field might be named _currentColumn / _currentPosition / etc.")
-    print("    Consider running Il2CppDumper for a full dump.cs to grep.")
+with open(OUT, 'w') as f: json.dump(result, f, indent=2)
+print(f"[*] written to {OUT}")
