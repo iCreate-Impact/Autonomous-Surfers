@@ -39,7 +39,7 @@ typedef uintptr_t RTHCUINTPTR;
 static const uint32_t UVM_MAGIC   = 0x19700823;
 static const uint32_t PGM_RANGES_OFFSET = 0x1010; // pVM+0x1010 = pRamRangesXR3
 
-static const uintptr_t TARGET_HVA = 0x000002BDE7F7335C;
+static const uintptr_t TARGET_HVA = 0x000001D9B971735C;
 
 typedef PUVM     (WINAPI* pfnVMR3GetUVM)               (PVM);
 typedef PVM      (WINAPI* pfnVMR3GetVM)                (PUVM);
