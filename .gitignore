@@ -17,3 +17,4 @@ lab/logs/*.txt
 Thumbs.db
 .git\
 lab/base.apk
+lab/offsets.json
