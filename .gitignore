@@ -16,3 +16,4 @@ lab/logs/*.txt
 .DS_Store
 Thumbs.db
 .git\
+lab/base.apk
