@@ -15,6 +15,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdint.h>
 
@@ -135,14 +136,33 @@ static PUVM FindUVM(HMODULE hVMM,
 
 static DWORD WINAPI ReconThread(LPVOID)
 {
-    g_log = fopen("C:\\recon_out.txt", "w");
-    if (!g_log) g_log = fopen("X:\\recon_out.txt", "w"); // fallback to your X: drive
+    g_log = fopen("X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt", "w");
     LOG("[recon] started, pid=%u", GetCurrentProcessId());
 
     // 1. Get BstkVMM.dll handle
     HMODULE hVMM = GetModuleHandleA("BstkVMM.dll");
     if (!hVMM) { LOG("[recon] BstkVMM.dll not loaded"); goto done; }
     LOG("[recon] BstkVMM.dll base = %p", (void*)hVMM);
+
+    // ── dump all BstkVMM exports ──────────────────────────────────────────────
+    {
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hVMM;
+        IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)((uint8_t*)hVMM + dos->e_lfanew);
+        IMAGE_EXPORT_DIRECTORY* exp = (IMAGE_EXPORT_DIRECTORY*)
+            ((uint8_t*)hVMM + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+        DWORD* names    = (DWORD*)((uint8_t*)hVMM + exp->AddressOfNames);
+        WORD*  ordinals = (WORD*) ((uint8_t*)hVMM + exp->AddressOfNameOrdinals);
+        DWORD* funcs    = (DWORD*)((uint8_t*)hVMM + exp->AddressOfFunctions);
+
+        LOG("[exports] total named: %u", exp->NumberOfNames);
+        for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+            const char* name = (const char*)((uint8_t*)hVMM + names[i]);
+            DWORD rva = funcs[ordinals[i]];
+            LOG("[export] %s  rva=0x%08X  va=%p", name, rva, (uint8_t*)hVMM + rva);
+        }
+    }
+    // ───────────────────────────────────────────────────────────────────
 
     // 2. Resolve exports
 #define RESOLVE(name, type) \
@@ -200,7 +220,7 @@ static DWORD WINAPI ReconThread(LPVOID)
                 LOG("[recon] LANE_GPA read failed rc=%d", rc);
         }
 
-        LOG("[recon] done. check C:\\recon_out.txt");
+        LOG("[recon] done. check X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt");
     }
 
 done:
@@ -236,7 +256,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
  *
  *   injector.exe --pid <HD-Player PID> --dll recon.dll
  *
- * Then check C:\recon_out.txt for the RAM range dump.
+ * Then check X:\Github\Autonomous Subway\lab\logs\recon_out.txt for the RAM range dump.
  *
  * ── NEXT STEPS ────────────────────────────────────────────────────────────────
  *

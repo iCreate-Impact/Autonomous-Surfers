@@ -1,0 +1,18 @@
+# Local build output
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Logs and scratch artifacts
+lab/logs/*.txt
+*.log
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+.git\
