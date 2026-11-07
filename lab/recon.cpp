@@ -2,205 +2,227 @@
  * recon.dll — VirtualBox guest RAM recon
  * Target:  HD-Player.exe (BlueStacks 5+)
  * Compile: x64, MSVC or clang-cl
- * Build:   see bottom of file
  *
- * What it does:
- *   1. Finds BstkVMM.dll in-process
- *   2. Resolves VMR3GetUVM → gets live UVM*
- *   3. Calls PGMR3PhysGetRamRangeCount + PGMR3PhysGetRange
- *      to enumerate every guest RAM region
- *   4. Dumps results to C:\recon_out.txt
- *   5. Does a live read of the lane address you found (optional, see LANE_GPA)
+ *   cl /LD /O2 /EHsc recon.cpp /Fe:recon.dll /link /DLL psapi.lib
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdint.h>
 
 // ── types ────────────────────────────────────────────────────────────────────
 
-// Opaque VirtualBox handles — we only need the pointer identity
-typedef void* PUVM;
-typedef void* PVM;
-typedef uint64_t RTGCPHYS;
+typedef void*     PUVM;
+typedef void*     PVM;
+typedef uint64_t  RTGCPHYS;
 typedef uintptr_t RTHCUINTPTR;
-
-// Return codes
-typedef int32_t VBOXSTRICTRC;
 #define VINF_SUCCESS 0
 
-// PGMR3PhysGetRange output struct
-// Source: VirtualBox OSE include/VBox/vmm/pgm.h
 typedef struct PGMPHYSRANGEINFO {
-    RTGCPHYS    GCPhysStart;    // guest physical base of this range
-    RTGCPHYS    GCPhysEnd;      // guest physical end (inclusive)
-    RTHCUINTPTR HCPtrStart;     // host virtual address of range base (0 if not mapped)
-    bool        fHasMapping;    // true if HCPtrStart is valid
+    RTGCPHYS    GCPhysStart;
+    RTGCPHYS    GCPhysEnd;
+    RTHCUINTPTR HCPtrStart;
+    bool        fHasMapping;
 } PGMPHYSRANGEINFO;
 
-// ── function pointer types ────────────────────────────────────────────────────
-
-// PUVM VMR3GetUVM(PVM pVM)
-// We get PVM from a global — see note below
-typedef PUVM   (WINAPI* pfnVMR3GetUVM)(PVM pVM);
-
-// unsigned VMR3GetState(PUVM pUVM) — used to verify VM is running
-typedef unsigned (WINAPI* pfnVMR3GetState)(PUVM pUVM);
-
-// uint32_t PGMR3PhysGetRamRangeCount(PUVM pUVM)
+typedef PUVM     (WINAPI* pfnVMR3GetUVM)               (PVM pVM);
+typedef PVM      (WINAPI* pfnVMR3GetVM)                (PUVM pUVM);
+typedef unsigned (WINAPI* pfnVMR3GetState)             (PUVM pUVM);
 typedef uint32_t (WINAPI* pfnPGMR3PhysGetRamRangeCount)(PUVM pUVM);
+typedef int      (WINAPI* pfnPGMR3PhysGetRange)        (PUVM pUVM, uint32_t iRange, PGMPHYSRANGEINFO* pInfo);
+typedef int      (WINAPI* pfnPGMPhysSimpleReadGCPhys)  (PVM pVM, void* pvDst, RTGCPHYS GCPhysSrc, size_t cb);
+typedef int      (WINAPI* pfnPGMPhysSimpleWriteGCPhys) (PVM pVM, RTGCPHYS GCPhysDst, const void* pvSrc, size_t cb);
 
-// int PGMR3PhysGetRange(PUVM pUVM, uint32_t iRange, PGMPHYSRANGEINFO *pInfo)
-typedef int (WINAPI* pfnPGMR3PhysGetRange)(PUVM pUVM, uint32_t iRange, PGMPHYSRANGEINFO* pInfo);
-
-// int PGMR3PhysSimpleReadGCPhys(PUVM pUVM, void *pvDst, RTGCPHYS GCPhysSrc, size_t cb)
-typedef int (WINAPI* pfnPGMR3PhysSimpleReadGCPhys)(PUVM pUVM, void* pvDst, RTGCPHYS GCPhysSrc, size_t cb);
-
-// int PGMR3PhysSimpleWriteGCPhys(PUVM pUVM, RTGCPHYS GCPhysDst, const void *pvSrc, size_t cb)
-typedef int (WINAPI* pfnPGMR3PhysSimpleWriteGCPhys)(PUVM pUVM, RTGCPHYS GCPhysDst, const void* pvSrc, size_t cb);
-
-// ── globals ───────────────────────────────────────────────────────────────────
-
-// Set LANE_GPA to the guest physical address of lane value once we know it.
-// Leave as 0 on first run — the dump will tell us the RAM layout.
-// After mapping CE's virtual address → guest physical, fill this in and re-run.
 #define LANE_GPA  ((RTGCPHYS)0)
+#define LOG_PATH  "X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt"
 
 static FILE* g_log = nullptr;
-
 #define LOG(fmt, ...) do { \
     if (g_log) { fprintf(g_log, fmt "\n", ##__VA_ARGS__); fflush(g_log); } \
     char _buf[512]; sprintf_s(_buf, fmt "\n", ##__VA_ARGS__); \
     OutputDebugStringA(_buf); \
 } while(0)
 
-// ── UVM hunting ───────────────────────────────────────────────────────────────
-// BlueStacks doesn't expose PVM directly, but VMR3GetUVM is exported and
-// BstkVMM.dll keeps a global g_pVM / g_pUVM. We scan BstkVMM.dll's .data
-// section for a pointer that, when passed to VMR3GetState, returns a sane value.
+static const uint32_t VM_MAGIC = 0x0fd00fd0;
 
-static PUVM FindUVM(HMODULE hVMM,
-                    pfnVMR3GetState fnGetState,
-                    pfnPGMR3PhysGetRamRangeCount fnRangeCount)
+static pfnVMR3GetUVM                g_fnGetUVM;
+static pfnVMR3GetVM                 g_fnGetVM;
+static pfnVMR3GetState              g_fnGetState;
+static pfnPGMR3PhysGetRamRangeCount g_fnRangeCount;
+
+// ── UVM validation ────────────────────────────────────────────────────────────
+
+static bool IsRealUVM(PUVM candidate)
 {
-    // Walk BstkVMM.dll .data looking for a PUVM candidate
-    // A live UVM will have PGMR3PhysGetRamRangeCount return > 0
-    MODULEINFO mi = {};
-    if (!GetModuleInformation(GetCurrentProcess(), hVMM, &mi, sizeof(mi)))
-        return nullptr;
-
-    uint8_t* base = (uint8_t*)mi.lpBaseOfDll;
-    size_t   size = mi.SizeOfImage;
-
-    // Scan 8-byte aligned pointers in the module's writable sections
-    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-    IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        // Only writable, non-executable sections (.data, .bss)
-        DWORD chars = sec->Characteristics;
-        if (!(chars & IMAGE_SCN_MEM_WRITE))  continue;
-        if (  chars & IMAGE_SCN_MEM_EXECUTE) continue;
-
-        uint8_t* sBase = base + sec->VirtualAddress;
-        size_t   sSize = sec->Misc.VirtualSize;
-
-        for (size_t off = 0; off + 8 <= sSize; off += 8) {
-            PUVM candidate = *(PUVM*)(sBase + off);
-            if (!candidate) continue;
-            if ((uintptr_t)candidate < 0x10000) continue; // skip tiny values
-
-            __try {
-                uint32_t rc = fnRangeCount(candidate);
-                if (rc > 0 && rc < 64) {
-                    // Looks like a live UVM
-                    unsigned state = fnGetState(candidate);
-                    if (state < 16) { // sane state enum value
-                        LOG("[recon] UVM candidate at .data+0x%zX → %p (ranges=%u state=%u)",
-                            off, candidate, rc, state);
-                        return candidate;
-                    }
-                }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                // not a valid pointer, skip
-            }
-        }
-    }
-    return nullptr;
+    if (!candidate || (uintptr_t)candidate < 0x10000) return false;
+    __try {
+        uint32_t ranges = g_fnRangeCount(candidate);
+        if (ranges < 2 || ranges > 32) return false;
+        unsigned state = g_fnGetState(candidate);
+        if (state < 1 || state > 10)   return false;
+        PVM pvm = g_fnGetVM(candidate);
+        if (!pvm || (uintptr_t)pvm < 0x10000) return false;
+        if (*(uint32_t*)pvm != VM_MAGIC) return false;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// ── main recon ────────────────────────────────────────────────────────────────
+// ── thread stack scan ─────────────────────────────────────────────────────────
+// Suspend each thread except ours, walk its stack looking for pointers
+// that pass IsRealUVM. Focus on threads whose RSP/RIP is inside BstkVMM.dll.
+
+struct FindResult { PVM pVM; PUVM pUVM; };
+
+static FindResult ScanThreadStacks(uintptr_t vmmBase, size_t vmmSize)
+{
+    FindResult res = {};
+    DWORD myTid  = GetCurrentThreadId();
+    DWORD myPid  = GetCurrentProcessId();
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return res;
+
+    THREADENTRY32 te = { sizeof(te) };
+    if (!Thread32First(snap, &te)) { CloseHandle(snap); return res; }
+
+    do {
+        if (te.th32OwnerProcessID != myPid) continue;
+        if (te.th32ThreadID == myTid)       continue;
+
+        HANDLE hThread = OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+            FALSE, te.th32ThreadID);
+        if (!hThread) continue;
+
+        DWORD suspendCount = SuspendThread(hThread);
+        if (suspendCount == (DWORD)-1) { CloseHandle(hThread); continue; }
+
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(hThread, &ctx)) {
+            uintptr_t rip = ctx.Rip;
+            uintptr_t rsp = ctx.Rsp;
+            bool inVMM = (rip >= vmmBase && rip < vmmBase + vmmSize);
+
+            // log every thread briefly
+            LOG("[thread] tid=%u  RIP=%016llX  RSP=%016llX  %s",
+                te.th32ThreadID,
+                (unsigned long long)rip,
+                (unsigned long long)rsp,
+                inVMM ? "<<< IN BstkVMM" : "");
+
+            // scan 4KB of stack from RSP
+            uintptr_t stackTop = rsp;
+            for (uintptr_t p = stackTop; p < stackTop + 0x1000; p += 8) {
+                void* candidate = nullptr;
+                __try { candidate = *(void**)p; } __except(1) { continue; }
+                if (IsRealUVM((PUVM)candidate)) {
+                    LOG("[recon] UVM on stack of tid=%u at RSP+0x%llX → %p",
+                        te.th32ThreadID,
+                        (unsigned long long)(p - stackTop),
+                        candidate);
+                    res.pUVM = (PUVM)candidate;
+                    res.pVM  = g_fnGetVM(res.pUVM);
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                    CloseHandle(snap);
+                    return res;
+                }
+            }
+
+            // also check registers directly
+            uintptr_t regs[] = {
+                ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9,
+                ctx.Rdi, ctx.Rsi, ctx.Rbx, ctx.Rbp
+            };
+            for (int r = 0; r < 8; r++) {
+                if (IsRealUVM((PUVM)(void*)regs[r])) {
+                    LOG("[recon] UVM in register of tid=%u reg[%d]=%016llX",
+                        te.th32ThreadID, r, (unsigned long long)regs[r]);
+                    res.pUVM = (PUVM)(void*)regs[r];
+                    res.pVM  = g_fnGetVM(res.pUVM);
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                    CloseHandle(snap);
+                    return res;
+                }
+            }
+        }
+
+        ResumeThread(hThread);
+        CloseHandle(hThread);
+
+    } while (Thread32Next(snap, &te) && !res.pUVM);
+
+    CloseHandle(snap);
+    return res;
+}
+
+// ── main thread ───────────────────────────────────────────────────────────────
 
 static DWORD WINAPI ReconThread(LPVOID)
 {
-    g_log = fopen("X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt", "w");
-    LOG("[recon] started, pid=%u", GetCurrentProcessId());
+    // give BlueStacks a moment to settle after inject before we snapshot threads
+    Sleep(500);
 
-    // 1. Get BstkVMM.dll handle
+    g_log = fopen(LOG_PATH, "w");
+    LOG("[recon] started pid=%u", GetCurrentProcessId());
+
     HMODULE hVMM = GetModuleHandleA("BstkVMM.dll");
     if (!hVMM) { LOG("[recon] BstkVMM.dll not loaded"); goto done; }
-    LOG("[recon] BstkVMM.dll base = %p", (void*)hVMM);
 
-    // ── dump all BstkVMM exports ──────────────────────────────────────────────
     {
-        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hVMM;
-        IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)((uint8_t*)hVMM + dos->e_lfanew);
-        IMAGE_EXPORT_DIRECTORY* exp = (IMAGE_EXPORT_DIRECTORY*)
-            ((uint8_t*)hVMM + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+        MODULEINFO mi = {};
+        GetModuleInformation(GetCurrentProcess(), hVMM, &mi, sizeof(mi));
+        LOG("[recon] BstkVMM.dll base=%p size=0x%X",
+            (void*)hVMM, mi.SizeOfImage);
 
-        DWORD* names    = (DWORD*)((uint8_t*)hVMM + exp->AddressOfNames);
-        WORD*  ordinals = (WORD*) ((uint8_t*)hVMM + exp->AddressOfNameOrdinals);
-        DWORD* funcs    = (DWORD*)((uint8_t*)hVMM + exp->AddressOfFunctions);
+#define RESOLVE(name, type, global) \
+        global = (type)GetProcAddress(hVMM, #name); \
+        if (!global) { LOG("[recon] missing: " #name); goto done; } \
+        LOG("[recon] " #name " = %p", (void*)global);
 
-        LOG("[exports] total named: %u", exp->NumberOfNames);
-        for (DWORD i = 0; i < exp->NumberOfNames; i++) {
-            const char* name = (const char*)((uint8_t*)hVMM + names[i]);
-            DWORD rva = funcs[ordinals[i]];
-            LOG("[export] %s  rva=0x%08X  va=%p", name, rva, (uint8_t*)hVMM + rva);
-        }
-    }
-    // ───────────────────────────────────────────────────────────────────
-
-    // 2. Resolve exports
-#define RESOLVE(name, type) \
-    auto fn##name = (type)GetProcAddress(hVMM, #name); \
-    if (!fn##name) { LOG("[recon] missing export: " #name); goto done; } \
-    LOG("[recon] " #name " = %p", (void*)fn##name);
-
-    RESOLVE(VMR3GetState,              pfnVMR3GetState)
-    RESOLVE(PGMR3PhysGetRamRangeCount, pfnPGMR3PhysGetRamRangeCount)
-    RESOLVE(PGMR3PhysGetRange,         pfnPGMR3PhysGetRange)
-    RESOLVE(PGMR3PhysSimpleReadGCPhys, pfnPGMR3PhysSimpleReadGCPhys)
-    RESOLVE(PGMR3PhysSimpleWriteGCPhys,pfnPGMR3PhysSimpleWriteGCPhys)
+        RESOLVE(VMR3GetUVM,                pfnVMR3GetUVM,                g_fnGetUVM)
+        RESOLVE(VMR3GetVM,                 pfnVMR3GetVM,                 g_fnGetVM)
+        RESOLVE(VMR3GetState,              pfnVMR3GetState,              g_fnGetState)
+        RESOLVE(PGMR3PhysGetRamRangeCount, pfnPGMR3PhysGetRamRangeCount, g_fnRangeCount)
 #undef RESOLVE
 
-    // 3. Find live UVM
-    LOG("[recon] scanning for live UVM...");
-    {
-        PUVM uvm = FindUVM(hVMM, fnVMR3GetState, fnPGMR3PhysGetRamRangeCount);
-        if (!uvm) { LOG("[recon] UVM not found"); goto done; }
-        LOG("[recon] UVM = %p", uvm);
+        auto fnGetRange = (pfnPGMR3PhysGetRange)      GetProcAddress(hVMM, "PGMR3PhysGetRange");
+        auto fnRead     = (pfnPGMPhysSimpleReadGCPhys) GetProcAddress(hVMM, "PGMPhysSimpleReadGCPhys");
+        auto fnWrite    = (pfnPGMPhysSimpleWriteGCPhys)GetProcAddress(hVMM, "PGMPhysSimpleWriteGCPhys");
+        if (!fnGetRange || !fnRead || !fnWrite) {
+            LOG("[recon] missing range/read/write"); goto done;
+        }
 
-        // 4. Enumerate RAM ranges
-        uint32_t nRanges = fnPGMR3PhysGetRamRangeCount(uvm);
+        // ── thread stack scan ─────────────────────────────────────────────────
+        LOG("[recon] scanning thread stacks for UVM...");
+        uintptr_t vmmBase = (uintptr_t)mi.lpBaseOfDll;
+        size_t    vmmSize = mi.SizeOfImage;
+
+        FindResult vm = ScanThreadStacks(vmmBase, vmmSize);
+
+        if (!vm.pUVM) { LOG("[recon] UVM not found on any thread stack"); goto done; }
+
+        LOG("[recon] UVM=%p  PVM=%p", vm.pUVM, (void*)vm.pVM);
+
+        // ── RAM range table ───────────────────────────────────────────────────
+        uint32_t nRanges = g_fnRangeCount(vm.pUVM);
         LOG("[recon] RAM ranges: %u", nRanges);
         LOG("[recon] %-4s  %-18s  %-18s  %-18s  %s",
             "idx", "GCPhysStart", "GCPhysEnd", "HCVirtStart", "size(MB)");
 
-        uint64_t totalGuest = 0;
+        uint64_t total = 0;
         for (uint32_t i = 0; i < nRanges; i++) {
             PGMPHYSRANGEINFO info = {};
-            int rc = fnPGMR3PhysGetRange(uvm, i, &info);
-            if (rc != VINF_SUCCESS) {
-                LOG("[recon]   range %u: PGMR3PhysGetRange failed rc=%d", i, rc);
-                continue;
-            }
+            int rc = fnGetRange(vm.pUVM, i, &info);
+            if (rc != VINF_SUCCESS) { LOG("[recon]   range %u failed rc=%d", i, rc); continue; }
             uint64_t sz = info.GCPhysEnd - info.GCPhysStart + 1;
-            totalGuest += sz;
-            LOG("[recon]   [%2u]  GC:%016llX–%016llX  HC:%016llX  %.1f MB%s",
+            total += sz;
+            LOG("[recon]   [%2u]  GC:%016llX-%016llX  HC:%016llX  %.1f MB%s",
                 i,
                 (unsigned long long)info.GCPhysStart,
                 (unsigned long long)info.GCPhysEnd,
@@ -208,19 +230,19 @@ static DWORD WINAPI ReconThread(LPVOID)
                 sz / (1024.0 * 1024.0),
                 info.fHasMapping ? "" : "  (no HC mapping)");
         }
-        LOG("[recon] total guest RAM visible: %.1f MB", totalGuest / (1024.0 * 1024.0));
+        LOG("[recon] total guest RAM: %.1f MB", total / (1024.0 * 1024.0));
 
-        // 5. If LANE_GPA is set, do a test read
-        if (LANE_GPA != 0) {
-            int32_t laneVal = 0;
-            int rc = fnPGMR3PhysSimpleReadGCPhys(uvm, &laneVal, LANE_GPA, sizeof(laneVal));
+        // ── optional lane GPA read ────────────────────────────────────────────
+        if (LANE_GPA != 0 && vm.pVM) {
+            int32_t val = 0;
+            int rc = fnRead(vm.pVM, &val, LANE_GPA, sizeof(val));
             if (rc == VINF_SUCCESS)
-                LOG("[recon] LANE_GPA=0x%llX  value=%d", (unsigned long long)LANE_GPA, laneVal);
+                LOG("[recon] LANE_GPA=0x%llX  value=%d", (unsigned long long)LANE_GPA, val);
             else
                 LOG("[recon] LANE_GPA read failed rc=%d", rc);
         }
 
-        LOG("[recon] done. check X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt");
+        LOG("[recon] done.");
     }
 
 done:
@@ -228,44 +250,9 @@ done:
     return 0;
 }
 
-// ── DllMain ───────────────────────────────────────────────────────────────────
-
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
         CreateThread(nullptr, 0, ReconThread, nullptr, 0, nullptr);
     return TRUE;
 }
-
-/*
- * ── BUILD ─────────────────────────────────────────────────────────────────────
- *
- * From VS Developer Command Prompt (x64):
- *
- *   cl /LD /O2 /EHsc /W3 recon.cpp /Fe:recon.dll /link /DLL psapi.lib
- *
- * Or CMakeLists.txt:
- *
- *   add_library(recon SHARED recon.cpp)
- *   target_link_libraries(recon psapi)
- *   set_target_properties(recon PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
- *
- * ── INJECT ────────────────────────────────────────────────────────────────────
- *
- * Use your injector or any standard LoadLibrary injector:
- *
- *   injector.exe --pid <HD-Player PID> --dll recon.dll
- *
- * Then check X:\Github\Autonomous Subway\lab\logs\recon_out.txt for the RAM range dump.
- *
- * ── NEXT STEPS ────────────────────────────────────────────────────────────────
- *
- * 1. Run recon, get the RAM range table.
- * 2. Take the lane address CE gave you (e.g. 0x2BDE7F7335C).
- *    That is an HC (host virtual) address inside HD-Player.exe.
- *    Find which range's HCPtrStart ≤ 0x2BDE7F7335C ≤ HCPtrStart+size.
- *    guest_phys = GCPhysStart + (0x2BDE7F7335C - HCPtrStart)
- * 3. Set LANE_GPA to that guest_phys value and re-inject to verify the read.
- * 4. Once confirmed, we build the real bot dll using PGMR3PhysSimpleReadGCPhys
- *    for state reads and PGMR3PhysSimpleWriteGCPhys for input injection.
- */
