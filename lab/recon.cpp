@@ -70,94 +70,73 @@ static bool IsRealUVM(PUVM candidate)
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// ── thread stack scan ─────────────────────────────────────────────────────────
-// Suspend each thread except ours, walk its stack looking for pointers
-// that pass IsRealUVM. Focus on threads whose RSP/RIP is inside BstkVMM.dll.
+// ── virtual address space scan for PVM magic ─────────────────────────────────
+// Walk the entire VA space with VirtualQuery. For each committed readable
+// region, scan for the PVM magic dword. When found, derive UVM via VMR3GetUVM.
 
 struct FindResult { PVM pVM; PUVM pUVM; };
 
-static FindResult ScanThreadStacks(uintptr_t vmmBase, size_t vmmSize)
+static FindResult ScanVASpace()
 {
     FindResult res = {};
-    DWORD myTid  = GetCurrentThreadId();
-    DWORD myPid  = GetCurrentProcessId();
+    SYSTEM_INFO si = {};
+    GetSystemInfo(&si);
 
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return res;
+    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+    uintptr_t end  = (uintptr_t)si.lpMaximumApplicationAddress;
 
-    THREADENTRY32 te = { sizeof(te) };
-    if (!Thread32First(snap, &te)) { CloseHandle(snap); return res; }
+    uint64_t scanned = 0;
+    uint64_t hits    = 0;
 
-    do {
-        if (te.th32OwnerProcessID != myPid) continue;
-        if (te.th32ThreadID == myTid)       continue;
+    while (addr < end && !res.pUVM) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) { addr += 0x1000; continue; }
 
-        HANDLE hThread = OpenThread(
-            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-            FALSE, te.th32ThreadID);
-        if (!hThread) continue;
+        size_t regionSize = mbi.RegionSize;
 
-        DWORD suspendCount = SuspendThread(hThread);
-        if (suspendCount == (DWORD)-1) { CloseHandle(hThread); continue; }
+        // only scan committed, readable, non-guard pages
+        // skip image-backed pages (those are the DLL sections we already scanned)
+        bool readable  = (mbi.State == MEM_COMMIT);
+        bool hasRead   = (mbi.Protect & 0xFF) != PAGE_NOACCESS &&
+                         (mbi.Protect & 0xFF) != PAGE_EXECUTE &&
+                         !(mbi.Protect & PAGE_GUARD);
+        bool notImage  = (mbi.Type != MEM_IMAGE); // skip DLL/EXE sections
 
-        CONTEXT ctx = {};
-        ctx.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(hThread, &ctx)) {
-            uintptr_t rip = ctx.Rip;
-            uintptr_t rsp = ctx.Rsp;
-            bool inVMM = (rip >= vmmBase && rip < vmmBase + vmmSize);
+        if (readable && hasRead && notImage && regionSize >= 4) {
+            scanned += regionSize;
+            uint8_t* p   = (uint8_t*)addr;
+            uint8_t* pEnd = p + regionSize - 3;
 
-            // log every thread briefly
-            LOG("[thread] tid=%u  RIP=%016llX  RSP=%016llX  %s",
-                te.th32ThreadID,
-                (unsigned long long)rip,
-                (unsigned long long)rsp,
-                inVMM ? "<<< IN BstkVMM" : "");
-
-            // scan 4KB of stack from RSP
-            uintptr_t stackTop = rsp;
-            for (uintptr_t p = stackTop; p < stackTop + 0x1000; p += 8) {
-                void* candidate = nullptr;
-                __try { candidate = *(void**)p; } __except(1) { continue; }
-                if (IsRealUVM((PUVM)candidate)) {
-                    LOG("[recon] UVM on stack of tid=%u at RSP+0x%llX → %p",
-                        te.th32ThreadID,
-                        (unsigned long long)(p - stackTop),
-                        candidate);
-                    res.pUVM = (PUVM)candidate;
-                    res.pVM  = g_fnGetVM(res.pUVM);
-                    ResumeThread(hThread);
-                    CloseHandle(hThread);
-                    CloseHandle(snap);
-                    return res;
-                }
-            }
-
-            // also check registers directly
-            uintptr_t regs[] = {
-                ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9,
-                ctx.Rdi, ctx.Rsi, ctx.Rbx, ctx.Rbp
-            };
-            for (int r = 0; r < 8; r++) {
-                if (IsRealUVM((PUVM)(void*)regs[r])) {
-                    LOG("[recon] UVM in register of tid=%u reg[%d]=%016llX",
-                        te.th32ThreadID, r, (unsigned long long)regs[r]);
-                    res.pUVM = (PUVM)(void*)regs[r];
-                    res.pVM  = g_fnGetVM(res.pUVM);
-                    ResumeThread(hThread);
-                    CloseHandle(hThread);
-                    CloseHandle(snap);
-                    return res;
+            while (p < pEnd) {
+                __try {
+                    if (*(uint32_t*)p == VM_MAGIC) {
+                        hits++;
+                        PVM pvm = (PVM)p;
+                        // try to get UVM from this PVM
+                        PUVM uvm = g_fnGetUVM(pvm);
+                        if (uvm && (uintptr_t)uvm >= 0x10000) {
+                            if (IsRealUVM(uvm)) {
+                                LOG("[recon] PVM magic at %p → UVM=%p", p, uvm);
+                                res.pVM  = pvm;
+                                res.pUVM = uvm;
+                                return res;
+                            }
+                        }
+                        p += 8; // skip ahead past this hit
+                    } else {
+                        p += 4;
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    p += 0x1000; // skip faulting page
                 }
             }
         }
 
-        ResumeThread(hThread);
-        CloseHandle(hThread);
+        addr += regionSize;
+    }
 
-    } while (Thread32Next(snap, &te) && !res.pUVM);
-
-    CloseHandle(snap);
+    LOG("[recon] VA scan complete: %.1f MB scanned, %llu magic hits, UVM not confirmed",
+        scanned / (1024.0 * 1024.0), (unsigned long long)hits);
     return res;
 }
 
@@ -165,7 +144,6 @@ static FindResult ScanThreadStacks(uintptr_t vmmBase, size_t vmmSize)
 
 static DWORD WINAPI ReconThread(LPVOID)
 {
-    // give BlueStacks a moment to settle after inject before we snapshot threads
     Sleep(500);
 
     g_log = fopen(LOG_PATH, "w");
@@ -177,8 +155,7 @@ static DWORD WINAPI ReconThread(LPVOID)
     {
         MODULEINFO mi = {};
         GetModuleInformation(GetCurrentProcess(), hVMM, &mi, sizeof(mi));
-        LOG("[recon] BstkVMM.dll base=%p size=0x%X",
-            (void*)hVMM, mi.SizeOfImage);
+        LOG("[recon] BstkVMM.dll base=%p size=0x%X", (void*)hVMM, mi.SizeOfImage);
 
 #define RESOLVE(name, type, global) \
         global = (type)GetProcAddress(hVMM, #name); \
@@ -198,14 +175,10 @@ static DWORD WINAPI ReconThread(LPVOID)
             LOG("[recon] missing range/read/write"); goto done;
         }
 
-        // ── thread stack scan ─────────────────────────────────────────────────
-        LOG("[recon] scanning thread stacks for UVM...");
-        uintptr_t vmmBase = (uintptr_t)mi.lpBaseOfDll;
-        size_t    vmmSize = mi.SizeOfImage;
+        LOG("[recon] scanning VA space for PVM magic (0x%08X)...", VM_MAGIC);
+        FindResult vm = ScanVASpace();
 
-        FindResult vm = ScanThreadStacks(vmmBase, vmmSize);
-
-        if (!vm.pUVM) { LOG("[recon] UVM not found on any thread stack"); goto done; }
+        if (!vm.pUVM) { LOG("[recon] UVM not found"); goto done; }
 
         LOG("[recon] UVM=%p  PVM=%p", vm.pUVM, (void*)vm.pVM);
 
