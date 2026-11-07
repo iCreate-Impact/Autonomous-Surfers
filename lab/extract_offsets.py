@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-extract_offsets.py v6
+extract_offsets.py v7
 
-Fixes confirmed from hex dump:
-  - FC_OFF = 64  (uint16 at +0x40, not +0x44)
-  - FS_OFF = 32  (confirmed correct)
-  - parentIdx in v31 is a packed type token, not a raw typeIndex
-    upper 13 bits = assembly index, lower 19 bits = local type index within assembly
-    We decode it via the assembly/image tables instead of pair[22].
+Key fix: parentIdx is an index into Il2CppType[] (pair[13]),
+not into the typedef table or the typeIndex table.
+Il2CppType layout (ARM64, v27-v31):
+  +0x00  uint64 data   (union: for TYPE_CLASS/TYPE_VALUETYPE = typedef index)
+  +0x08  uint32 attrs
+  +0x0c  uint8  type   (IL2CPP_TYPE_* enum)
+  +0x0d  uint8  num_mods
+  +0x0e  uint8  byref
+  +0x0f  uint8  pinned
+Total = 16 bytes per entry.
 
-Changes:
-  - correct FC_OFF
-  - parent resolution via image table (pair[17]=imageDefinitions, pair[0]=assemblies)
-  - dumps the 3 CIC fields explicitly
-  - sane offset range widened to 0x10..0x2000 (some Unity objects are bigger)
-  - EmojiList diagnosis: reports its field range so we can see the overlap
+TYPE_CLASS      = 0x12
+TYPE_VALUETYPE  = 0x11
 
 Usage:  py -3 extract_offsets.py base.apk
 Output: offsets.json
@@ -28,11 +28,14 @@ OUT = "offsets.json"
 TARGET_FIELD  = "_currentLaneIndex"
 LANE_KEYWORDS = ["lane", "Lane"]
 
-# ── confirmed layout constants ────────────────────────────────────────────────
 TD_SIZE    = 88
-FS_OFF     = 32   # field_start (uint32) within Il2CppTypeDefinition
-FC_OFF     = 64   # field_count (uint16) — FIXED from hex dump (+0x40)
-PARENT_OFF = 20   # parentIdx  (int32)  — packed token in v31
+FS_OFF     = 32
+FC_OFF     = 64
+PARENT_OFF = 20
+
+TYPE_CLASS      = 0x12
+TYPE_VALUETYPE  = 0x11
+IL2CPP_TYPE_SIZE = 16
 
 # ── extract ───────────────────────────────────────────────────────────────────
 
@@ -61,68 +64,92 @@ FD_SIZE = 12
 n_types  = type_sz  // TD_SIZE
 n_fields = fdef_sz  // FD_SIZE
 print(f"[*] n_types={n_types}  n_fields={n_fields}")
-print(f"[*] layout: TD_SIZE={TD_SIZE}  FS_OFF={FS_OFF}  FC_OFF={FC_OFF}  PARENT_OFF={PARENT_OFF}")
 
 def cstr(rel):
     end = meta_data.index(b'\x00', str_off + rel)
     return meta_data[str_off + rel:end].decode('utf-8', errors='replace')
 
-# ── image/assembly table for parent token resolution ─────────────────────────
-# Il2CppImageDefinition (v27+): firstTypeIndex(uint32) + typeCount(uint32) + ...
-# pair[17] = imageDefinitions, each entry is 20 bytes in v27, possibly 24 in v31
-# We probe the entry size by checking that firstTypeIndex[0]=0 and
-# firstTypeIndex[0]+typeCount[0] <= n_types for a few images.
+# ── locate Il2CppType[] array ─────────────────────────────────────────────────
+# Try pair indices 13, 14, 15, 16 — look for one whose entry count is
+# larger than n_types (it must be, since it includes constructed types)
+# and where entry[0].type byte is a known IL2CPP_TYPE value.
 
-IMG_ENTRY_SIZES = (20, 24, 28)
-img_off, img_sz = pair(17)
-img_entry_size  = None
-n_images        = 0
+KNOWN_TYPES = set(range(0x01, 0x22))  # IL2CPP_TYPE_VOID..IL2CPP_TYPE_INTERNAL
 
-for es in IMG_ENTRY_SIZES:
-    n = img_sz // es
-    if n == 0:
+itype_off = itype_sz = n_itypes = itype_pair_idx = 0
+
+print(f"\n[*] probing Il2CppType[] array location...")
+for pi in range(12, 22):
+    off, sz = pair(pi)
+    if sz == 0:
         continue
-    # first image usually starts at typedef 0
-    fi0, = struct.unpack_from("<I", meta_data, img_off)
-    tc0, = struct.unpack_from("<I", meta_data, img_off + 4)
-    if fi0 == 0 and 0 < tc0 <= n_types:
-        img_entry_size = es
-        n_images = n
-        print(f"[*] image table: pair[17]  entry_size={es}  n_images={n}")
+    n = sz // IL2CPP_TYPE_SIZE
+    if n < n_types:
+        continue
+    # sample first 10 entries: type byte must be a known value
+    ok = 0
+    for i in range(min(10, n)):
+        type_byte = meta_data[off + i * IL2CPP_TYPE_SIZE + 12]
+        if type_byte in KNOWN_TYPES:
+            ok += 1
+    if ok >= 8:
+        itype_off, itype_sz, n_itypes, itype_pair_idx = off, sz, n, pi
+        print(f"[*] Il2CppType[]: pair[{pi}]  n={n_itypes}  "
+              f"(first type bytes: "
+              f"{[meta_data[off+i*IL2CPP_TYPE_SIZE+12] for i in range(5)]})")
         break
 
-# build image → (firstTypeIndex, typeCount) table
-images = []
-if img_entry_size:
-    for i in range(n_images):
-        b = img_off + i * img_entry_size
-        fi, = struct.unpack_from("<I", meta_data, b)
-        tc, = struct.unpack_from("<I", meta_data, b + 4)
-        images.append((fi, tc))
+if not n_itypes:
+    print("[!] Il2CppType[] not found — dumping pair table for manual inspection:")
+    for pi in range(0, 35):
+        off, sz = pair(pi)
+        if sz == 0: continue
+        print(f"  pair[{pi}]: off={off:#x}  sz={sz:#x}  n_as_16={sz//16}")
 
-def decode_parent_token(token):
-    """
-    v31 parentIdx encoding: packed type token.
-    upper 13 bits = image/assembly index, lower 19 bits = local type index.
-    Returns typedef index or None.
-    """
-    if token < 0 or token == 0x7FFFFFFF:
+def parent_token_to_typedef(token):
+    """Resolve parentIdx as an index into Il2CppType[]."""
+    if token < 0 or token == 0x7FFFFFFF or not n_itypes:
         return None
-    img_idx   = (token >> 19) & 0x1FFF
-    local_idx =  token        & 0x7FFFF
-    if img_idx < len(images):
-        first, count = images[img_idx]
-        global_idx = first + local_idx
-        if global_idx < n_types:
-            return global_idx
-    # fallback: try as raw typedef index
-    if token < n_types:
-        return token
-    return None
+    if token >= n_itypes:
+        return None
+    b = itype_off + token * IL2CPP_TYPE_SIZE
+    type_byte = meta_data[b + 12]
+    if type_byte not in (TYPE_CLASS, TYPE_VALUETYPE):
+        return None
+    # data field (uint64) = typedef index for class/valuetype
+    data, = struct.unpack_from("<Q", meta_data, b)
+    if data >= n_types:
+        return None
+    return int(data)
+
+# verify: MonoBehaviour parent should resolve to Behaviour
+mono_idx = None
+for i in range(n_types):
+    b = type_off + i * TD_SIZE
+    try:
+        ni, nsi = struct.unpack_from("<II", meta_data, b)
+        if cstr(ni) == 'MonoBehaviour' and cstr(nsi) == 'UnityEngine':
+            mono_idx = i
+            break
+    except Exception:
+        pass
+
+if mono_idx is not None:
+    mb = type_off + mono_idx * TD_SIZE
+    ptok, = struct.unpack_from("<i", meta_data, mb + PARENT_OFF)
+    resolved = parent_token_to_typedef(ptok)
+    if resolved is not None:
+        rb = type_off + resolved * TD_SIZE
+        rni, rnsi = struct.unpack_from("<II", meta_data, rb)
+        print(f"[*] verify: MonoBehaviour parent token={ptok} → "
+              f"typedef[{resolved}] = {cstr(rnsi)}.{cstr(rni)}")
+    else:
+        print(f"[!] MonoBehaviour parent token={ptok} still unresolvable — "
+              f"Il2CppType[] probe may be wrong")
 
 # ── build typedef table ───────────────────────────────────────────────────────
 
-print(f"[*] building typedef table...")
+print(f"\n[*] building typedef table...")
 all_types = []
 for i in range(n_types):
     b = type_off + i * TD_SIZE
@@ -146,7 +173,7 @@ for i in range(n_types):
 
 field_to_typedef = {}
 for td in all_types:
-    if td is None or td['field_count'] == 0:
+    if td is None or td['field_count'] == 0 or td['field_start'] == 0xFFFFFFFF:
         continue
     for fi in range(td['field_count']):
         abs_fi = td['field_start'] + fi
@@ -156,105 +183,79 @@ for td in all_types:
 known = len(field_to_typedef)
 print(f"[*] field_to_typedef coverage: {known}/{n_fields} ({100*known/n_fields:.1f}%)")
 
-top5 = sorted([td for td in all_types if td],
+top5 = sorted([td for td in all_types if td and td['field_start'] != 0xFFFFFFFF],
               key=lambda t: t['field_count'], reverse=True)[:5]
-print(f"[*] top 5 classes by field_count:")
+print(f"[*] top 5 classes by field_count (excluding sentinel):")
 for td in top5:
     ns_name = f"{td['ns']}.{td['name']}" if td['ns'] else td['name']
-    print(f"    {ns_name}  field_count={td['field_count']}  "
-          f"field_start={td['field_start']}  "
-          f"range=[{td['field_start']}..{td['field_start']+td['field_count']-1}]")
-
-# ── EmojiList diagnosis ───────────────────────────────────────────────────────
-emoji = next((td for td in all_types if td and td['name'] == 'EmojiList'), None)
-if emoji:
-    print(f"\n[*] EmojiList: field_start={emoji['field_start']}  "
-          f"field_count={emoji['field_count']}  "
-          f"range=[{emoji['field_start']}..{emoji['field_start']+emoji['field_count']-1}]")
-    print(f"    abs_fi 735..3047 fall inside this range: "
-          f"{emoji['field_start']} <= 735 and 3047 <= {emoji['field_start']+emoji['field_count']-1}")
-
-# ── dump CharacterInputController fields explicitly ───────────────────────────
-
-print(f"\n[*] CharacterInputController explicit field dump:")
-cic_td = next((td for td in all_types
-               if td and td['name'] == 'CharacterInputController'
-               and td['ns'] == 'SYBO.RunnerCore.Character'), None)
-
-if not cic_td:
-    print("  NOT FOUND")
-else:
-    print(f"  typedef_idx={cic_td['typedef_idx']}  "
-          f"field_start={cic_td['field_start']}  "
-          f"field_count={cic_td['field_count']}  "
-          f"parent_tidx={cic_td['parent_tidx']}")
-    # decode parent
-    parent_resolved = decode_parent_token(cic_td['parent_tidx'])
-    if parent_resolved is not None and all_types[parent_resolved]:
-        pt = all_types[parent_resolved]
-        print(f"  parent resolved → [{parent_resolved}] "
-              f"{pt['ns']}.{pt['name']}  "
-              f"field_count={pt['field_count']}")
-    else:
-        print(f"  parent token {cic_td['parent_tidx']} → unresolvable")
-
-    for fi in range(cic_td['field_count']):
-        abs_fi = cic_td['field_start'] + fi
-        b = fdef_off + abs_fi * FD_SIZE
-        try:
-            name_idx, = struct.unpack_from("<I", meta_data, b)
-            fname     = cstr(name_idx)
-            raw,      = struct.unpack_from("<I", meta_data, foff_off + abs_fi * 4)
-            foff      = raw & 0x7FFFFFFF
-            static    = bool(raw & 0x80000000)
-            marker    = " ← TARGET" if fname == TARGET_FIELD else ""
-            print(f"  [{abs_fi}] '{fname}'  offset={foff:#x}  static={static}{marker}")
-        except Exception as ex:
-            print(f"  [{abs_fi}] error: {ex}")
+    print(f"    {ns_name}  fc={td['field_count']}  fs={td['field_start']}")
 
 # ── parent chain walk ─────────────────────────────────────────────────────────
 
-print(f"\n[*] full parent chain of CharacterInputController:")
-if cic_td:
+def walk_chain(start_td, label):
+    print(f"\n[*] parent chain of {label}:")
+    if start_td is None:
+        print("  NOT FOUND")
+        return
     visited = set()
-    cur     = cic_td
-    depth   = 0
+    cur = start_td
+    depth = 0
     while cur:
         if cur['typedef_idx'] in visited:
             print(f"  [depth {depth}] circular, stopping")
             break
         visited.add(cur['typedef_idx'])
         ns_name = f"{cur['ns']}.{cur['name']}" if cur['ns'] else cur['name']
+        fs = cur['field_start']
+        fc = cur['field_count']
+        fs_str = hex(fs) if fs != 0xFFFFFFFF else "0xFFFFFFFF(none)"
         print(f"  [depth {depth}] [{cur['typedef_idx']}] {ns_name}  "
-              f"fields={cur['field_count']}  field_start={cur['field_start']}")
+              f"fields={fc}  field_start={fs_str}")
 
-        for fi in range(cur['field_count']):
-            abs_fi = cur['field_start'] + fi
-            b = fdef_off + abs_fi * FD_SIZE
-            try:
-                name_idx, = struct.unpack_from("<I", meta_data, b)
-                fname     = cstr(name_idx)
-                raw,      = struct.unpack_from("<I", meta_data, foff_off + abs_fi * 4)
-                foff      = raw & 0x7FFFFFFF
-                static    = bool(raw & 0x80000000)
-                marker    = " ← TARGET" if fname == TARGET_FIELD else ""
-                print(f"    [{abs_fi}] '{fname}'  offset={foff:#x}  static={static}{marker}")
-            except Exception as ex:
-                print(f"    [{abs_fi}] error: {ex}")
+        if fc > 0 and fs != 0xFFFFFFFF:
+            for fi in range(fc):
+                abs_fi = fs + fi
+                if abs_fi >= n_fields:
+                    print(f"    [{abs_fi}] out of range")
+                    continue
+                b = fdef_off + abs_fi * FD_SIZE
+                try:
+                    name_idx, = struct.unpack_from("<I", meta_data, b)
+                    fname     = cstr(name_idx)
+                    raw,      = struct.unpack_from("<I", meta_data, foff_off + abs_fi * 4)
+                    foff      = raw & 0x7FFFFFFF
+                    static    = bool(raw & 0x80000000)
+                    marker    = " ← TARGET" if fname == TARGET_FIELD else ""
+                    lane_m    = " [lane]" if any(k in fname for k in LANE_KEYWORDS) else ""
+                    print(f"    [{abs_fi}] '{fname}'  offset={foff:#x}  "
+                          f"static={static}{lane_m}{marker}")
+                except Exception as ex:
+                    print(f"    [{abs_fi}] error: {ex}")
 
-        parent_resolved = decode_parent_token(cur['parent_tidx'])
-        if parent_resolved is None:
-            print(f"  → no parent (token={cur['parent_tidx']}), stopping")
+        ptok = cur['parent_tidx']
+        if ptok < 0 or ptok == 0x7FFFFFFF:
+            print(f"  → no parent, done")
             break
-        next_td = all_types[parent_resolved] if parent_resolved < len(all_types) else None
-        if next_td is None:
-            print(f"  → parent typedef {parent_resolved} unreadable, stopping")
+        td_idx = parent_token_to_typedef(ptok)
+        if td_idx is None:
+            print(f"  → parent token {ptok} unresolvable, stopping")
             break
-        cur   = next_td
+        cur = all_types[td_idx] if td_idx < len(all_types) else None
         depth += 1
         if depth > 25:
             print("  [depth limit]")
             break
+
+cic_td = next((td for td in all_types
+               if td and td['name'] == 'CharacterInputController'
+               and td['ns'] == 'SYBO.RunnerCore.Character'), None)
+walk_chain(cic_td, "CharacterInputController")
+
+# also walk CharacterMotor — it had real fields and laneDirection is in RunnerCore
+motor_td = next((td for td in all_types
+                 if td and td['name'] == 'CharacterMotor'
+                 and td['ns'] == 'SYBO.RunnerCore.Character'), None)
+walk_chain(motor_td, "CharacterMotor")
 
 # ── scan ALL fields for lane-related names ────────────────────────────────────
 
@@ -301,7 +302,7 @@ for abs_fi in range(n_fields):
 print(f"[*] found {len(lane_fields)} lane-related field(s):")
 for e in lane_fields:
     marker = " ← EXACT" if e['field_name'] == TARGET_FIELD else ""
-    sane_s = " [sane]" if e['sane'] else ""
+    sane_s = " [sane]"  if e['sane'] else ""
     print(f"    [{e['abs_fi']}] {e['owner']}.{e['field_name']}  "
           f"offset={e['offset']:#x}{sane_s}{marker}")
 
@@ -314,7 +315,8 @@ if target_hits:
 elif lane_fields:
     priority = ('currentLane', 'laneIndex', '_currentLaneIndex')
     for pool in (
-        [e for e in lane_fields if e['sane'] and e['owner'] != '<unknown>' and e['field_name'] in priority],
+        [e for e in lane_fields if e['sane'] and e['owner'] != '<unknown>'
+         and e['field_name'] in priority],
         [e for e in lane_fields if e['sane'] and e['owner'] != '<unknown>'],
         [e for e in lane_fields if e['sane']],
     ):
@@ -323,7 +325,8 @@ elif lane_fields:
             break
 
 if best:
-    print(f"\n[*] best candidate: {best['owner']}.{best['field_name']}  offset={best['offset']:#x}")
+    print(f"\n[*] best candidate: {best['owner']}.{best['field_name']}  "
+          f"offset={best['offset']:#x}")
 else:
     print("\n[!] no usable lane field found")
 
@@ -366,9 +369,9 @@ if best and best['owner'] not in ('<unknown>', ''):
         rva = foff_to_rva(p)
         if rva: hits.append((p, rva))
         pos = p + 1
-    print(f"\n[*] '{class_simple}' string: {len(hits)} hit(s) in libil2cpp.so")
+    print(f"\n[*] '{class_simple}' ELF string hits: {len(hits)}")
 
-    for (sfoff, srva) in hits:
+    for sfoff, srva in hits:
         needle2 = struct.pack("<Q", srva)
         pos2 = 0
         while True:
@@ -391,7 +394,8 @@ if best and best['owner'] not in ('<unknown>', ''):
             if ns_str != class_ns: continue
             il2cpp_class_rva = class_base
             vtable_rva       = class_base + 0x128
-            print(f"[*] Il2CppClass* RVA = {il2cpp_class_rva:#x}  vtable RVA = {vtable_rva:#x}")
+            print(f"[*] Il2CppClass* RVA = {il2cpp_class_rva:#x}  "
+                  f"vtable RVA = {vtable_rva:#x}")
             break
         if vtable_rva: break
 
@@ -411,7 +415,9 @@ result = {
     "vtable_rva":       vtable_rva,
     "metadata_version": version,
     "libil2cpp_size":   len(lib_data),
-    "field_layout":     {"TD_SIZE": TD_SIZE, "FS_OFF": FS_OFF, "FC_OFF": FC_OFF, "PARENT_OFF": PARENT_OFF},
+    "field_layout":     {"TD_SIZE": TD_SIZE, "FS_OFF": FS_OFF,
+                         "FC_OFF": FC_OFF, "PARENT_OFF": PARENT_OFF,
+                         "itype_pair": itype_pair_idx, "n_itypes": n_itypes},
     "tidx_coverage":    known,
     "all_lane_fields":  lane_fields,
 }
