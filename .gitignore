@@ -19,3 +19,4 @@ lab/logs/*.txt
 Thumbs.db
 /.vs
 /lab/SubwayBot
+/truth
