@@ -7,7 +7,9 @@
 *.exp
 *.lib
 
-# Logs and scratch artifacts
+# Project-generated artifacts
+lab/*.json
+lab/*.apk
 lab/logs/*.txt
 *.log
 
@@ -15,8 +17,4 @@ lab/logs/*.txt
 .vscode/
 .DS_Store
 Thumbs.db
-.git\
-lab/base.apk
-lab/offsets.json
-lab/lane_hits.json
-lab/probe_results.json
+/.vs

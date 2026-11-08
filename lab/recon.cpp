@@ -27,7 +27,7 @@
  *   LANE  ?\n   bad read (GPA stale — send new SET_GPA)
  *
  * Compile (VS x64 Native Tools prompt):
- *   cl /LD /O2 /EHsc recon_v12.cpp /Fe:recon.dll /link /DLL psapi.lib
+ *   cl /LD /O2 /EHsc recon.cpp /Fe:recon.dll /link /DLL psapi.lib
  *
  * Inject once per BlueStacks session. Never call FreeLibrary on it.
  */
