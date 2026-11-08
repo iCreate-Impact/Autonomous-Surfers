@@ -822,16 +822,46 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
                     }
                 }
 
-                // Check for STOP command (non-blocking peek)
+                // Non-blocking command check while streaming.
+                // Handles STOP, SET_GPA, PING, READ — anything the client sends mid-stream.
                 DWORD avail = 0;
                 if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
-                    char cmd[64] = {};
+                    char cmd[256] = {};
                     if (!PipeReadLine(pipe, cmd, sizeof(cmd))) goto client_done;
+
                     if (strcmp(cmd, "STOP") == 0) {
                         g_streaming.store(false);
                         PipeSend(pipe, "OK\n");
                         break;
                     }
+                    else if (strncmp(cmd, "SET_GPA ", 8) == 0) {
+                        uint64_t newgpa = 0;
+                        if (sscanf_s(cmd + 8, "%llx", &newgpa) == 1 && newgpa < GUEST_RAM_BYTES) {
+                            g_laneGpa.store(newgpa);
+                            prev = 999; // force immediate emit on next tick
+                            LOG("pipe: SET_GPA %016llX (mid-stream)", (unsigned long long)newgpa);
+                            if (!PipeSend(pipe, "OK\n")) goto client_done;
+                        } else {
+                            if (!PipeSend(pipe, "ERR bad GPA\n")) goto client_done;
+                        }
+                    }
+                    else if (strcmp(cmd, "PING") == 0) {
+                        if (!PipeSend(pipe, "PONG\n")) goto client_done;
+                    }
+                    else if (strcmp(cmd, "READ") == 0) {
+                        RTGCPHYS rgpa = (RTGCPHYS)g_laneGpa.load();
+                        int32_t rval = -99;
+                        char rresp[32];
+                        if (rgpa == 0) {
+                            snprintf(rresp, sizeof(rresp), "ERR no GPA set\n");
+                        } else if (GuestRead(rgpa, &rval, 4) && rval >= -1 && rval <= 1) {
+                            snprintf(rresp, sizeof(rresp), "LANE %d\n", rval);
+                        } else {
+                            snprintf(rresp, sizeof(rresp), "LANE ?\n");
+                        }
+                        if (!PipeSend(pipe, rresp)) goto client_done;
+                    }
+                    // unknown mid-stream command: silently ignore to keep stream alive
                 }
 
                 Sleep(16);

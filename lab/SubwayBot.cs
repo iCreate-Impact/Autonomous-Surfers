@@ -163,12 +163,20 @@ class SubwayBot
                 }
                 else if (int.TryParse(val, out int lane))
                 {
-                    s_laneValid  = true;
+                    s_laneValid   = true;
                     s_currentLane = lane;
                     string name = lane == -1 ? "LEFT" : lane == 0 ? "CENTER" : "RIGHT";
                     Console.WriteLine($"[bot]  LANE {lane,2}  ({name})");
-                    // Bot logic is called here — see BotReact() below
                 }
+            }
+            else if (line == "OK" || line == "PONG" || line.StartsWith("ERR"))
+            {
+                // Ack from a mid-stream command (SET_GPA, PING, etc.)
+                Console.WriteLine($"[pipe] {line}");
+            }
+            else if (line.StartsWith("STATUS"))
+            {
+                Console.WriteLine($"[recon] {line}");
             }
         }
 
