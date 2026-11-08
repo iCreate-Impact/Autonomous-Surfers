@@ -137,6 +137,8 @@ Must use page table walk to translate every GVA → GPA individually.
 | 1 | `0x19343A3DE9C` | `0x192947184F0` | `0xAF32599C` | read `0x4D617469` ("Mati") — wrong address |
 | 1 | `0x19343A3DE9C` | `0x192947184F0` | `0xAF3259AC` | `-16769532` — HVA_BASE stale (new session) |
 | 2 (crash+restart) | `0x180C439C11C` | `0x18025E584F0` | `0x9E543C2C` | pending |
+| 3 (crash+restart) | `0x1F2BDE0A11C` | `0x1F27C3784F0` | `0x41A91C2C` | SET_GPA silently dropped — mid-stream command bug in pipe server (fixed in v12 patch) |
+| 4 (crash+restart) | `0x22B6B8FAC5C` | `0x22B22C684F0` | `0x48C9276C` | pending — first session with fixed pipe server |
 
 **GPA formula:** `GPA = CE_HVA - HVA_BASE`
 where `HVA_BASE` = `HC` field of `range[0]` in Stage 2 log (the flat 3584 MB range).
@@ -145,6 +147,38 @@ where `HVA_BASE` = `HC` field of `range[0]` in Stage 2 log (the flat 3584 MB ran
 - Reading ASCII garbage → off by a few bytes, re-scan CE with 4-byte int filter
 - Reading large negative / random int → HVA_BASE is from a previous session; restart BlueStacks or re-inject to get fresh Stage 2 log
 - CE address in wrong process → ensure CE is attached to `HD-Player.exe`, not a child
+- SET_GPA sent mid-stream with no response → pipe server only handled STOP in streaming loop (fixed in v12 patch)
+
+---
+
+## Stage 3a/3b milestone — session 4
+
+**libil2cpp.so found for the first time** at `GPA=0x9D6E4000`, `dyn_offset=73.7 MB` ✓
+
+Three candidates this scan:
+```
+GPA=0x9A8B6000  phnum=10  dyn_offset=0x24A88   (0.1 MB)  — rejected, too small
+GPA=0x9AE7C000  phnum=5   dyn_offset=0xEE0     (0.0 MB)  — rejected, too small
+GPA=0x9D6E4000  phnum=10  dyn_offset=0x49AAD70 (73.7 MB) — IDENTIFIED libil2cpp.so ✓
+```
+
+Lowering the ELF scan floor from `0x10000000` to `0x1000000` in v12 was what made this possible — previous sessions the header page landed below the old floor.
+
+**Stage 3b: PTE scan — no candidates found**
+
+Scanned all 3584 MB of guest RAM for a PTE with `OA == 0x9D6E4000`. Zero hits.
+
+Root cause: the ELF header page (`0x9D6E4000`) is a **physical page that is not currently mapped** in any live process page table. The kernel loaded `libil2cpp.so`, read the ELF header to set up the mapping, then the header page was reclaimed / evicted. The `.text` and `.data` segments are still mapped and in use — just not the header page itself.
+
+**Next fix options (in order of preference):**
+
+1. **Don't scan for the header page.** Instead, find the `.text` segment — it's always resident while the game runs. Strategy: find any export RVA we know (e.g. `il2cpp_domain_get`, known from offline metadata), scan guest RAM for the ARM64 function prologue at that RVA offset from each candidate base. The base that matches is `libil2cpp_load_base`.
+
+2. **Scan for SONAME string.** The string `"libil2cpp.so"` lives in `.dynstr`, which is in the resident `.rodata` segment. Scan for it, then walk back to find the load base.
+
+3. **Scan for a unique IL2CPP global pointer.** `g_Il2CppInteropData` or similar — a known-pattern pointer that only exists in libil2cpp's data segment. Offset from it to load base is stable per build.
+
+Option 2 is fastest to implement. Option 1 is most robust long-term.
 
 ---
 
