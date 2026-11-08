@@ -18,3 +18,4 @@ lab/logs/*.txt
 .DS_Store
 Thumbs.db
 /.vs
+/lab/SubwayBot
