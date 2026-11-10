@@ -1,17 +1,22 @@
 /*
- * recon.dll  v14  — upper-bits filter removed, 2MB block support, GVA-aware stage 5-6
+ * recon.dll  v15  — two-phase TTBR0 discovery, no PT_DYNAMIC dependency
  *
- * What changed from v13:
- *   BUG FIX: upper-bits ARM64 PTE filter removed from all PTE/PMD/PGD scan
- *     loops in FindTTBR0 and FindTTBR0_Resident.  ARM64 data/rodata PTEs have
- *     UXN=1 (bit 54), making e>>48 = 0x0040; the old filter silently dropped
- *     every one of them.  Replaced with IsValidDescriptor() throughout.
- *   NEW: 2MB PMD block support in FindTTBR0_Resident (THP for .so segments).
- *   BUG FIX: TryReadFieldOffset -- name_ptr >= GUEST_RAM_BYTES rejected all
- *     64-bit GVA field-name pointers.  Fixed with GvaReadStr when ttbr0 known.
- *   BUG FIX: FindLaneGPA -- vtable klass GVA compared to class GPA directly.
- *     Fixed: GvaToGpa translate first, then compare.
- *   PERF: FindLaneFields reads one 4 KB page per VBox call (~500x speedup).
+ * What changed from v14:
+ *   BUG FIX: TryWalk backward walk used PT_DYNAMIC accessibility as the
+ *     verification signal.  PT_DYNAMIC pages are evicted post-startup (the
+ *     dynamic linker reads them once, then the kernel reclaims the frames),
+ *     so GvaToGpa for dyn_gva fails at every k and all walks exhausted.
+ *   NEW: two-phase TTBR0 discovery.  Phase 1 (FindAllTTBR0Candidates)
+ *     collects ALL (pgd, gva_res) pairs that map the SONAME page, without
+ *     any backward walk or load_bias computation.  Phase 2 (ScanClass-
+ *     Candidates + FindLaneFieldsMulti) scans GPA space once for class
+ *     structures with field_count=99, then tries every TTBR0 candidate
+ *     against them: only the game process's TTBR0 correctly translates
+ *     the GVA fields pointer to a GPA whose field names read correctly.
+ *   ClassCandidate struct added.  FieldResult.ttbr0 added.
+ *   dyn_vaddr now logged in stage 3a for diagnosing future walk issues.
+ *   Stage 4 skipped (no load_bias from two-phase path); stage 4 still
+ *     runs if the classic ELF-header path ever succeeds.
  *
  * What was kept from v11->v12:
  *   - BotLoop() removed from the DLL. Bot logic lives in SubwayBot (VS project).
@@ -468,6 +473,10 @@ static LibInfo FindLibIl2CppBase()
 
         // libil2cpp.so: PT_DYNAMIC lives >64 MB into the file — unique fingerprint.
         if (li.dyn_offset >= 0x4000000ULL) {
+            LOG("  dyn_vaddr=0x%llX load0_vaddr=0x%llX dyn_offset_in_va=0x%llX",
+                (unsigned long long)li.dyn_vaddr,
+                (unsigned long long)li.load0_vaddr,
+                (unsigned long long)(li.dyn_vaddr - li.load0_vaddr));
             LOG("  IDENTIFIED libil2cpp.so (dyn_offset %.1f MB > 64 MB threshold)",
                 (double)li.dyn_offset / (1024.0 * 1024.0));
             li.valid = true;
@@ -587,27 +596,40 @@ static RTGCPHYS FindSonamePageGPA()
 }
 
 
-// ── FindTTBR0_Resident ────────────────────────────────────────────────────────────────────────────
-// Same three-level reverse PTE walk as FindTTBR0, but against the SONAME page.
-// v14: upper-bits ARM64 PTE filter removed; 2MB PMD block support added.
-//   4KB PTE   bits[1:0]==11,  OA[47:12] == page GPA
-//   2MB block bits[1:0]==01,  OA[47:21] == 2MB-aligned block GPA
-// After recovering TTBR0 and gva_res, walk backward 4 KB/step until
-// PT_DYNAMIC is translatable and the first four DYN entries are plausible.
+// ── FindAllTTBR0Candidates ─────────────────────────────────────────────────────────────────────────
+//
+// Replaces FindTTBR0_Resident's TryWalk approach.  TryWalk verified via
+// PT_DYNAMIC accessibility; those pages are evicted post-startup (dynamic
+// linker reads them once, kernel reclaims the frames) so the walk always
+// exhausted.
+//
+// This function collects ALL (pgd, gva_res) pairs that map the SONAME page
+// without any backward walk.  load_bias_gva is left at 0.  The correct
+// TTBR0 (game process) is identified later in FindLaneFieldsMulti, which
+// tries each candidate against pre-scanned class structure candidates:
+// only the game process's TTBR0 correctly translates the GVA fields pointer
+// to a readable field-name GPA.
+//
+// Up to MAX_CANDIDATES unique TTBR0 values are returned (deduplicated by
+// pgd address).
 
-static PageTableInfo FindTTBR0_Resident(RTGCPHYS resident_page_gpa,
-                                        const LibInfo& lib)
+static std::vector<PageTableInfo>
+FindAllTTBR0Candidates(RTGCPHYS resident_gpa, const LibInfo& lib)
 {
-    PageTableInfo result = {};
-    if (resident_page_gpa == (RTGCPHYS)-1ULL) {
-        LOG("FindTTBR0_Resident: no resident page");
-        return result;
+    std::vector<PageTableInfo> results;
+    static const size_t MAX_CANDIDATES = 64;
+
+    if (resident_gpa == (RTGCPHYS)-1ULL) {
+        LOG("FindAllTTBR0Candidates: no resident page");
+        return results;
     }
-    uint64_t target_oa     = resident_page_gpa & ARM64_OA_MASK;
-    uint64_t target_oa_2mb = resident_page_gpa & 0x0000FFFFFFE00000ULL;
+
+    uint64_t target_oa     = resident_gpa & ARM64_OA_MASK;
+    uint64_t target_oa_2mb = resident_gpa & 0x0000FFFFFFE00000ULL;
     uint64_t page_in_block = target_oa & 0x0000000001FF000ULL;
-    LOG("=== stage 3b-resident: leaf scan for GPA=%016llX ===",
-        (unsigned long long)resident_page_gpa);
+
+    LOG("=== stage 3b-candidates: leaf scan for GPA=%016llX ===",
+        (unsigned long long)resident_gpa);
 
     // ---- pass 1: 4KB PTEs and 2MB PMD blocks --------------------------------
     struct LeafEntry { RTGCPHYS loc; bool is_block; };
@@ -621,8 +643,7 @@ static PageTableInfo FindTTBR0_Resident(RTGCPHYS resident_page_gpa,
         uint8_t type = (uint8_t)(e & 0x3);
         if (type == 0x3) {
             if (!IsValidDescriptor(e)) continue;
-            if ((e & ARM64_OA_MASK) == target_oa)
-                leaves.push_back({gpa, false});
+            if ((e & ARM64_OA_MASK) == target_oa) leaves.push_back({gpa, false});
         } else if (type == 0x1) {
             uint64_t oa2 = e & 0x0000FFFFFFE00000ULL;
             if (oa2 == target_oa_2mb && oa2 > 0 && oa2 < GUEST_RAM_BYTES)
@@ -630,55 +651,17 @@ static PageTableInfo FindTTBR0_Resident(RTGCPHYS resident_page_gpa,
         }
         if (leaves.size() >= 32) break;
     }
-    if (leaves.empty()) {
-        LOG("  no leaf entries found (4KB PTEs or 2MB blocks)");
-        return result;
-    }
+    if (leaves.empty()) { LOG("  no leaf entries found"); return results; }
     LOG("  %zu leaf entries found", leaves.size());
 
-    uint64_t dyn_offset_in_va = lib.dyn_vaddr - lib.load0_vaddr;
-    static const uint64_t MAX_WALK = 25000;
-
-    auto TryWalk = [&](RTGCPHYS pgd, uint64_t gva_res, const char* tag) -> bool {
-        for (uint64_t k = 0; k <= MAX_WALK; k++) {
-            if (k * 0x1000 > gva_res) break;
-            uint64_t lb   = gva_res - k * 0x1000;
-            uint64_t dgva = lb + dyn_offset_in_va;
-            RTGCPHYS dgpa = 0;
-            if (!GvaToGpa(pgd, dgva, &dgpa)) continue;
-            Elf64Dyn ents[4] = {};
-            if (!GuestRead(dgpa, ents, sizeof(ents))) continue;
-            bool ok = true;
-            for (int ei = 0; ei < 4 && ok; ei++) {
-                int64_t t = ents[ei].d_tag;
-                if (t == DT_NULL) break;
-                if (t < 1 || t > 32) { ok = false; break; }
-                if (ents[ei].d_val == 0 && t != 15 && t != 24) ok = false;
-            }
-            if (!ok) continue;
-            LOG("  VERIFIED [%s]: TTBR0=%016llX load_bias=%016llX "
-                "(k=%llu tag[0]=%lld tag[1]=%lld)",
-                tag, (unsigned long long)pgd, (unsigned long long)lb,
-                (unsigned long long)k,
-                (long long)ents[0].d_tag, (long long)ents[1].d_tag);
-            result.ttbr0         = pgd;
-            result.load_bias_gva = lb;
-            result.valid         = true;
-            return true;
-        }
-        LOG("  walk [%s] exhausted pgd=%016llX gva=%016llX",
-            tag, (unsigned long long)pgd, (unsigned long long)gva_res);
-        return false;
-    };
-
-    // ---- passes 2 & 3 -------------------------------------------------------
+    // ---- passes 2 & 3: walk leaf → PGD, collect unique TTBR0s ---------------
     for (const auto& leaf : leaves) {
+        if (results.size() >= MAX_CANDIDATES) break;
         RTGCPHYS lp = leaf.loc & ~(RTGCPHYS)0xFFF;
         uint64_t li = (leaf.loc & 0xFFF) / 8;
+
         if (!leaf.is_block) {
-            LOG("  4KB leaf @ %016llX  pte_page=%016llX  idx=%llu",
-                (unsigned long long)leaf.loc,
-                (unsigned long long)lp, (unsigned long long)li);
+            // 4KB path: PTE page -> PMD (table) -> PGD
             std::vector<RTGCPHYS> pmds;
             for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
                 uint64_t e = 0;
@@ -689,9 +672,11 @@ static PageTableInfo FindTTBR0_Resident(RTGCPHYS resident_page_gpa,
                 if (pmds.size() >= 8) break;
             }
             for (RTGCPHYS pm : pmds) {
+                if (results.size() >= MAX_CANDIDATES) break;
                 RTGCPHYS pp = pm & ~(RTGCPHYS)0xFFF;
                 uint64_t pi = (pm & 0xFFF) / 8;
                 for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
+                    if (results.size() >= MAX_CANDIDATES) break;
                     uint64_t e = 0;
                     if (!GuestRead64(gpa, &e)) continue;
                     if (!IsValidDescriptor(e)) continue;
@@ -700,19 +685,21 @@ static PageTableInfo FindTTBR0_Resident(RTGCPHYS resident_page_gpa,
                     uint64_t gi  = (gpa & 0xFFF) / 8;
                     uint64_t gva = (gi << 30) | (pi << 21) | (li << 12);
                     if (gva >= 0x8000000000ULL) continue;
-                    LOG("  4KB TTBR0 cand pgd=%016llX gva=%016llX",
+                    // Sanity: GvaToGpa should map gva -> target_oa
+                    RTGCPHYS chk = 0;
+                    if (!GvaToGpa(pgd, gva, &chk) || chk != target_oa) continue;
+                    bool dup = false;
+                    for (const auto& r : results) if (r.ttbr0 == pgd) { dup=true; break; }
+                    if (dup) continue;
+                    LOG("  4KB cand: pgd=%016llX gva=%016llX",
                         (unsigned long long)pgd, (unsigned long long)gva);
-                    if (TryWalk(pgd, gva, "4KB")) return result;
+                    results.push_back({pgd, 0, true});
                 }
             }
         } else {
-            LOG("  2MB leaf @ %016llX  pmd_page=%016llX  idx=%llu  "
-                "covers %016llX-%016llX",
-                (unsigned long long)leaf.loc, (unsigned long long)lp,
-                (unsigned long long)li,
-                (unsigned long long)target_oa_2mb,
-                (unsigned long long)(target_oa_2mb + 0x1FFFFF));
+            // 2MB path: PMD block IS leaf -> PGD (one level up)
             for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
+                if (results.size() >= MAX_CANDIDATES) break;
                 uint64_t e = 0;
                 if (!GuestRead64(gpa, &e)) continue;
                 if (!IsValidDescriptor(e)) continue;
@@ -721,15 +708,19 @@ static PageTableInfo FindTTBR0_Resident(RTGCPHYS resident_page_gpa,
                 uint64_t gi  = (gpa & 0xFFF) / 8;
                 uint64_t gva = (gi << 30) | (li << 21) | page_in_block;
                 if (gva >= 0x8000000000ULL) continue;
-                LOG("  2MB TTBR0 cand pgd=%016llX gva=%016llX",
+                RTGCPHYS chk = 0;
+                if (!GvaToGpa(pgd, gva, &chk) || chk != target_oa) continue;
+                bool dup = false;
+                for (const auto& r : results) if (r.ttbr0 == pgd) { dup=true; break; }
+                if (dup) continue;
+                LOG("  2MB cand: pgd=%016llX gva=%016llX",
                     (unsigned long long)pgd, (unsigned long long)gva);
-                if (TryWalk(pgd, gva, "2MB")) return result;
+                results.push_back({pgd, 0, true});
             }
         }
     }
-    LOG("  TTBR0 not found via resident page approach (%zu leaves tried)",
-        leaves.size());
-    return result;
+    LOG("  %zu unique TTBR0 candidates collected", results.size());
+    return results;
 }
 
 
@@ -804,9 +795,13 @@ static Il2CppExports ReadIl2CppExports(const LibInfo& lib, const PageTableInfo& 
     return exp;
 }
 
+// GPA + GVA-of-fields-array for one class structure found during scan
+struct ClassCandidate { RTGCPHYS gpa; uint64_t fields_gva; };
+
 struct FieldResult {
     uint32_t currentLane_offset, laneIndex_offset;
-    uint64_t class_gpa;
+    RTGCPHYS class_gpa;
+    RTGCPHYS ttbr0;    // winning TTBR0, or 0 if not via page table
     bool ok;
 };
 
@@ -852,6 +847,88 @@ static bool ReadClassFieldCount(RTGCPHYS class_gpa, uint32_t* out_count)
     return false;
 }
 
+// ScanClassCandidates: single page-granularity scan of guest RAM.
+// Collects (gpa, fields_gva) pairs where any known field-count offset holds 99.
+// Called once; results are reused by FindLaneFieldsMulti across all TTBR0 candidates.
+static std::vector<ClassCandidate> ScanClassCandidates()
+{
+    std::vector<ClassCandidate> results;
+    static const uint32_t fc_offs[] = { 0xBC, 0xB8, 0xC0, 0xC4, 0x88, 0x90 };
+    static const uint32_t MAX_OFF = 0x1000 - 0x100;
+    uint8_t page[4096];
+    LOG("=== STAGE 5a: class candidate scan ===");
+    for (RTGCPHYS pgpa = 0x40000000ULL; pgpa < GUEST_RAM_BYTES; pgpa += 0x1000) {
+        if ((pgpa & 0x0FFFFFFF) == 0)
+            LOG("  candidate scan: GPA=%016llX", (unsigned long long)pgpa);
+        if (!GuestRead(pgpa, page, sizeof(page))) continue;
+        for (uint32_t off = 0; off < MAX_OFF; off += 8) {
+            bool fc_ok = false;
+            for (uint32_t fco : fc_offs) {
+                uint32_t v; memcpy(&v, page + off + fco, 4);
+                if ((v & 0xFFFF) == 99) { fc_ok = true; break; }
+            }
+            if (!fc_ok) continue;
+            uint64_t fields_gva = 0;
+            GuestRead64(pgpa + off + CLASS_OFF_FIELDS, &fields_gva);
+            if (!fields_gva) continue;
+            results.push_back({pgpa + off, fields_gva});
+            if (results.size() >= 500) goto scan_done;
+        }
+    }
+scan_done:
+    LOG("  %zu class candidates with field_count=99", results.size());
+    return results;
+}
+
+// FindLaneFieldsMulti: for each TTBR0 candidate, try to match one of the
+// pre-scanned class candidates.  Only the game process's TTBR0 correctly
+// translates the GVA fields pointer to a GPA whose field names read back as
+// "currentLane" and "laneIndex".  Runs in microseconds after ScanClassCandidates.
+static FieldResult FindLaneFieldsMulti(
+    const std::vector<ClassCandidate>& class_cands,
+    const std::vector<PageTableInfo>&  ttbr0_list)
+{
+    LOG("=== STAGE 5b: TTBR0 x class matching (%zu ttbrs, %zu candidates) ===",
+        ttbr0_list.size(), class_cands.size());
+    for (const auto& pt : ttbr0_list) {
+        for (const auto& cand : class_cands) {
+            RTGCPHYS fields_ptr = 0;
+            if (pt.ttbr0 != 0 && cand.fields_gva >= GUEST_RAM_BYTES) {
+                if (!GvaToGpa(pt.ttbr0, cand.fields_gva, &fields_ptr)) continue;
+            } else if (cand.fields_gva < GUEST_RAM_BYTES && !(cand.fields_gva & 7)) {
+                fields_ptr = (RTGCPHYS)cand.fields_gva;
+            } else {
+                continue;
+            }
+            uint32_t off40 = 0, off83 = 0;
+            if (!TryReadFieldOffset(fields_ptr, 40, "currentLane", &off40, pt.ttbr0)) continue;
+            if (!TryReadFieldOffset(fields_ptr, 83, "laneIndex",   &off83, pt.ttbr0)) continue;
+            uint64_t name_gva = 0; GuestRead64(cand.gpa + CLASS_OFF_NAME, &name_gva);
+            std::string cls_name;
+            if (pt.ttbr0 != 0 && name_gva >= GUEST_RAM_BYTES)
+                cls_name = GvaReadStr(pt.ttbr0, name_gva, 128);
+            else if (name_gva && name_gva < GUEST_RAM_BYTES)
+                cls_name = GuestReadStr((RTGCPHYS)name_gva, 128);
+            else
+                cls_name = "<unknown>";
+            LOG("FOUND [ttbr0=%016llX] class \"%s\" @ GPA=%016llX "
+                "currentLane=+%u  laneIndex=+%u",
+                (unsigned long long)pt.ttbr0, cls_name.c_str(),
+                (unsigned long long)cand.gpa, off40, off83);
+            FieldResult res;
+            res.ok = true;
+            res.currentLane_offset = off40;
+            res.laneIndex_offset   = off83;
+            res.class_gpa          = cand.gpa;
+            res.ttbr0              = pt.ttbr0;
+            return res;
+        }
+    }
+    LOG("  no TTBR0 matched any class candidate");
+    return {};
+}
+
+// FindLaneFields: single-TTBR0 fallback (kept for direct use if needed)
 static FieldResult FindLaneFields(RTGCPHYS ttbr0 = 0)
 {
     FieldResult res = {};
@@ -880,9 +957,7 @@ static FieldResult FindLaneFields(RTGCPHYS ttbr0 = 0)
                 if (!GvaToGpa(ttbr0, fields_gva, &fields_ptr)) continue;
             } else if (fields_gva < GUEST_RAM_BYTES && !(fields_gva & 7)) {
                 fields_ptr = (RTGCPHYS)fields_gva;
-            } else {
-                continue;
-            }
+            } else { continue; }
             uint32_t off40 = 0, off83 = 0;
             if (!TryReadFieldOffset(fields_ptr, 40, "currentLane", &off40, ttbr0)) continue;
             if (!TryReadFieldOffset(fields_ptr, 83, "laneIndex",   &off83, ttbr0)) continue;
@@ -892,14 +967,11 @@ static FieldResult FindLaneFields(RTGCPHYS ttbr0 = 0)
                 cls_name = GvaReadStr(ttbr0, name_gva, 128);
             else if (name_gva && name_gva < GUEST_RAM_BYTES)
                 cls_name = GuestReadStr((RTGCPHYS)name_gva, 128);
-            else
-                cls_name = "<unknown>";
+            else cls_name = "<unknown>";
             LOG("FOUND class \"%s\" @ GPA=%016llX  currentLane=+%u  laneIndex=+%u",
                 cls_name.c_str(), (unsigned long long)gpa, off40, off83);
-            res.currentLane_offset = off40;
-            res.laneIndex_offset   = off83;
-            res.class_gpa          = gpa;
-            res.ok                 = true;
+            res.ok = true; res.currentLane_offset = off40;
+            res.laneIndex_offset = off83; res.class_gpa = gpa; res.ttbr0 = ttbr0;
             return res;
         }
     }
@@ -1191,25 +1263,45 @@ static DWORD WINAPI ReconThread(LPVOID)
         LibInfo lib = FindLibIl2CppBase();
         if (!lib.valid) goto done;
 
-        LOG("=== STAGE 3b: page table walk ===");
-        PageTableInfo pt = FindTTBR0(lib.elf_header_gpa);
-        if (!pt.valid) {
-            LOG("classic TTBR0 scan failed -- trying SONAME resident-page approach");
+        // ---- stage 3b: collect TTBR0 candidates ----------------------------
+        // Classic path (ELF header page, usually evicted): may give us
+        // load_bias_gva, enabling stage 4.  SONAME path collects all candidate
+        // TTBR0s without a backward walk -- game process identified in stage 5b.
+        LOG("=== STAGE 3b: TTBR0 candidates ===");
+        std::vector<PageTableInfo> ttbr0_list;
+        {
+            PageTableInfo pt_classic = FindTTBR0(lib.elf_header_gpa);
+            if (pt_classic.valid) {
+                LOG("  classic path: TTBR0=%016llX load_bias=%016llX",
+                    (unsigned long long)pt_classic.ttbr0,
+                    (unsigned long long)pt_classic.load_bias_gva);
+                ttbr0_list.push_back(pt_classic);
+            }
+        }
+        {
             RTGCPHYS soname_gpa = FindSonamePageGPA();
-            pt = FindTTBR0_Resident(soname_gpa, lib);
+            auto soname_ttbrs   = FindAllTTBR0Candidates(soname_gpa, lib);
+            for (auto& t : soname_ttbrs) ttbr0_list.push_back(t);
         }
-        if (pt.valid) {
-            LOG("=== STAGE 4: export RVAs ===");
-            ReadIl2CppExports(lib, pt);
-        } else {
-            LOG("TTBR0 not found by any method -- skipping stage 4");
+        LOG("  total TTBR0 candidates: %zu", ttbr0_list.size());
+
+        // ---- stage 4: exports (only when load_bias is known) ----------------
+        for (const auto& pt : ttbr0_list) {
+            if (pt.load_bias_gva != 0) {
+                LOG("=== STAGE 4: export RVAs ===");
+                ReadIl2CppExports(lib, pt);
+                break;
+            }
         }
-        LOG("=== STAGE 5: field offset discovery ===");
-        FieldResult fields = FindLaneFields(pt.valid ? pt.ttbr0 : 0);
+
+        // ---- stage 5: two-phase class discovery ----------------------------
+        auto class_cands = ScanClassCandidates();
+
+        FieldResult fields = FindLaneFieldsMulti(class_cands, ttbr0_list);
         if (!fields.ok) { LOG("field discovery failed"); goto done; }
 
         LOG("=== STAGE 6: instance scan ===");
-        RTGCPHYS lane_gpa = FindLaneGPA(fields, pt.valid ? pt.ttbr0 : 0);
+        RTGCPHYS lane_gpa = FindLaneGPA(fields, fields.ttbr0);
         if (lane_gpa != (RTGCPHYS)-1) {
             g_laneGpa.store(lane_gpa);
             LOG("auto-discovered LANE_GPA=%016llX — pipe server is streaming",
