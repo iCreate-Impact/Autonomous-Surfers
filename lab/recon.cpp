@@ -1,22 +1,20 @@
 /*
- * recon.dll  v15  — two-phase TTBR0 discovery, no PT_DYNAMIC dependency
+ * recon.dll  v16  — stage 3a failure no longer fatal; full pipeline runs without ELF header
  *
- * What changed from v14:
- *   BUG FIX: TryWalk backward walk used PT_DYNAMIC accessibility as the
- *     verification signal.  PT_DYNAMIC pages are evicted post-startup (the
- *     dynamic linker reads them once, then the kernel reclaims the frames),
- *     so GvaToGpa for dyn_gva fails at every k and all walks exhausted.
- *   NEW: two-phase TTBR0 discovery.  Phase 1 (FindAllTTBR0Candidates)
- *     collects ALL (pgd, gva_res) pairs that map the SONAME page, without
- *     any backward walk or load_bias computation.  Phase 2 (ScanClass-
- *     Candidates + FindLaneFieldsMulti) scans GPA space once for class
- *     structures with field_count=99, then tries every TTBR0 candidate
- *     against them: only the game process's TTBR0 correctly translates
- *     the GVA fields pointer to a GPA whose field names read correctly.
- *   ClassCandidate struct added.  FieldResult.ttbr0 added.
- *   dyn_vaddr now logged in stage 3a for diagnosing future walk issues.
- *   Stage 4 skipped (no load_bias from two-phase path); stage 4 still
- *     runs if the classic ELF-header path ever succeeds.
+ * What changed from v15:
+ *   BUG FIX: "libil2cpp.so not found" aborted the entire pipeline via
+ *     "if (!lib.valid) goto done".  The ELF header page of libil2cpp.so
+ *     is evicted quickly after mmap; if the DLL is injected after the game
+ *     has been running for more than a few seconds, stage 3a never fires.
+ *     Stages 3b/5a/5b/6 do not need LibInfo at all, so the goto done is
+ *     removed.  Stage 3a data is used only where available (stage 4 and
+ *     the classic ELF-header TTBR0 path remain guarded by lib.valid).
+ *   FindAllTTBR0Candidates: unused LibInfo parameter removed.
+ *
+ * What was kept from v14->v15:
+ *   Two-phase TTBR0 discovery (no PT_DYNAMIC backward walk).
+ *   ClassCandidate struct, FieldResult.ttbr0, ScanClassCandidates,
+ *   FindLaneFieldsMulti, GVA-aware TryReadFieldOffset/FindLaneGPA.
  *
  * What was kept from v11->v12:
  *   - BotLoop() removed from the DLL. Bot logic lives in SubwayBot (VS project).
@@ -473,9 +471,8 @@ static LibInfo FindLibIl2CppBase()
 
         // libil2cpp.so: PT_DYNAMIC lives >64 MB into the file — unique fingerprint.
         if (li.dyn_offset >= 0x4000000ULL) {
-            LOG("  dyn_vaddr=0x%llX load0_vaddr=0x%llX dyn_offset_in_va=0x%llX",
-                (unsigned long long)li.dyn_vaddr,
-                (unsigned long long)li.load0_vaddr,
+            LOG("  dyn_vaddr=0x%016llX  load0_vaddr=0x%016llX  dyn_offset_in_va=0x%016llX",
+                (unsigned long long)li.dyn_vaddr, (unsigned long long)li.load0_vaddr,
                 (unsigned long long)(li.dyn_vaddr - li.load0_vaddr));
             LOG("  IDENTIFIED libil2cpp.so (dyn_offset %.1f MB > 64 MB threshold)",
                 (double)li.dyn_offset / (1024.0 * 1024.0));
@@ -568,10 +565,9 @@ static PageTableInfo FindTTBR0(RTGCPHYS elf_header_gpa)
 
 
 // ── FindSonamePageGPA ─────────────────────────────────────────────────────────────────────────────────
-// ELF header page of libil2cpp.so is evicted after mmap — no live PTEs
-// point to it.  ".dynstr" in .rodata is always resident.  Scan for the
-// null-terminated SONAME "libil2cpp.so" and return its page-aligned GPA,
-// or (RTGCPHYS)-1 on failure.
+// ".dynstr" is in .rodata and always resident while the game runs.
+// Scan for the null-terminated SONAME "libil2cpp.so" and return its
+// page-aligned GPA, or (RTGCPHYS)-1 on failure.
 
 static RTGCPHYS FindSonamePageGPA()
 {
@@ -598,23 +594,13 @@ static RTGCPHYS FindSonamePageGPA()
 
 // ── FindAllTTBR0Candidates ─────────────────────────────────────────────────────────────────────────
 //
-// Replaces FindTTBR0_Resident's TryWalk approach.  TryWalk verified via
-// PT_DYNAMIC accessibility; those pages are evicted post-startup (dynamic
-// linker reads them once, kernel reclaims the frames) so the walk always
-// exhausted.
-//
-// This function collects ALL (pgd, gva_res) pairs that map the SONAME page
-// without any backward walk.  load_bias_gva is left at 0.  The correct
-// TTBR0 (game process) is identified later in FindLaneFieldsMulti, which
-// tries each candidate against pre-scanned class structure candidates:
-// only the game process's TTBR0 correctly translates the GVA fields pointer
-// to a readable field-name GPA.
-//
-// Up to MAX_CANDIDATES unique TTBR0 values are returned (deduplicated by
-// pgd address).
+// Collects all (pgd, gva_res) pairs that map the SONAME page WITHOUT any
+// backward walk or load_bias computation.  Deduplicates by pgd value.
+// Does NOT require LibInfo -- works even when stage 3a failed.
+// The correct TTBR0 (game process) is identified in FindLaneFieldsMulti.
 
 static std::vector<PageTableInfo>
-FindAllTTBR0Candidates(RTGCPHYS resident_gpa, const LibInfo& lib)
+FindAllTTBR0Candidates(RTGCPHYS resident_gpa)
 {
     std::vector<PageTableInfo> results;
     static const size_t MAX_CANDIDATES = 64;
@@ -654,14 +640,14 @@ FindAllTTBR0Candidates(RTGCPHYS resident_gpa, const LibInfo& lib)
     if (leaves.empty()) { LOG("  no leaf entries found"); return results; }
     LOG("  %zu leaf entries found", leaves.size());
 
-    // ---- passes 2 & 3: walk leaf → PGD, collect unique TTBR0s ---------------
+    // ---- passes 2 & 3: walk leaf -> PGD, deduplicate by pgd value -----------
     for (const auto& leaf : leaves) {
         if (results.size() >= MAX_CANDIDATES) break;
         RTGCPHYS lp = leaf.loc & ~(RTGCPHYS)0xFFF;
         uint64_t li = (leaf.loc & 0xFFF) / 8;
 
         if (!leaf.is_block) {
-            // 4KB path: PTE page -> PMD (table) -> PGD
+            // 4KB path: PTE page -> PMD -> PGD
             std::vector<RTGCPHYS> pmds;
             for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
                 uint64_t e = 0;
@@ -685,11 +671,10 @@ FindAllTTBR0Candidates(RTGCPHYS resident_gpa, const LibInfo& lib)
                     uint64_t gi  = (gpa & 0xFFF) / 8;
                     uint64_t gva = (gi << 30) | (pi << 21) | (li << 12);
                     if (gva >= 0x8000000000ULL) continue;
-                    // Sanity: GvaToGpa should map gva -> target_oa
                     RTGCPHYS chk = 0;
                     if (!GvaToGpa(pgd, gva, &chk) || chk != target_oa) continue;
                     bool dup = false;
-                    for (const auto& r : results) if (r.ttbr0 == pgd) { dup=true; break; }
+                    for (const auto& r : results) if (r.ttbr0==pgd){dup=true;break;}
                     if (dup) continue;
                     LOG("  4KB cand: pgd=%016llX gva=%016llX",
                         (unsigned long long)pgd, (unsigned long long)gva);
@@ -711,7 +696,7 @@ FindAllTTBR0Candidates(RTGCPHYS resident_gpa, const LibInfo& lib)
                 RTGCPHYS chk = 0;
                 if (!GvaToGpa(pgd, gva, &chk) || chk != target_oa) continue;
                 bool dup = false;
-                for (const auto& r : results) if (r.ttbr0 == pgd) { dup=true; break; }
+                for (const auto& r : results) if (r.ttbr0==pgd){dup=true;break;}
                 if (dup) continue;
                 LOG("  2MB cand: pgd=%016llX gva=%016llX",
                     (unsigned long long)pgd, (unsigned long long)gva);
@@ -795,7 +780,6 @@ static Il2CppExports ReadIl2CppExports(const LibInfo& lib, const PageTableInfo& 
     return exp;
 }
 
-// GPA + GVA-of-fields-array for one class structure found during scan
 struct ClassCandidate { RTGCPHYS gpa; uint64_t fields_gva; };
 
 struct FieldResult {
@@ -849,7 +833,7 @@ static bool ReadClassFieldCount(RTGCPHYS class_gpa, uint32_t* out_count)
 
 // ScanClassCandidates: single page-granularity scan of guest RAM.
 // Collects (gpa, fields_gva) pairs where any known field-count offset holds 99.
-// Called once; results are reused by FindLaneFieldsMulti across all TTBR0 candidates.
+// Called once; results reused by FindLaneFieldsMulti across all TTBR0 candidates.
 static std::vector<ClassCandidate> ScanClassCandidates()
 {
     std::vector<ClassCandidate> results;
@@ -880,10 +864,9 @@ scan_done:
     return results;
 }
 
-// FindLaneFieldsMulti: for each TTBR0 candidate, try to match one of the
-// pre-scanned class candidates.  Only the game process's TTBR0 correctly
-// translates the GVA fields pointer to a GPA whose field names read back as
-// "currentLane" and "laneIndex".  Runs in microseconds after ScanClassCandidates.
+// FindLaneFieldsMulti: tries every TTBR0 against pre-scanned class candidates.
+// Only the game process TTBR0 correctly translates the GVA fields pointer to a
+// GPA whose field names read back as "currentLane" and "laneIndex".
 static FieldResult FindLaneFieldsMulti(
     const std::vector<ClassCandidate>& class_cands,
     const std::vector<PageTableInfo>&  ttbr0_list)
@@ -897,9 +880,7 @@ static FieldResult FindLaneFieldsMulti(
                 if (!GvaToGpa(pt.ttbr0, cand.fields_gva, &fields_ptr)) continue;
             } else if (cand.fields_gva < GUEST_RAM_BYTES && !(cand.fields_gva & 7)) {
                 fields_ptr = (RTGCPHYS)cand.fields_gva;
-            } else {
-                continue;
-            }
+            } else { continue; }
             uint32_t off40 = 0, off83 = 0;
             if (!TryReadFieldOffset(fields_ptr, 40, "currentLane", &off40, pt.ttbr0)) continue;
             if (!TryReadFieldOffset(fields_ptr, 83, "laneIndex",   &off83, pt.ttbr0)) continue;
@@ -1261,15 +1242,20 @@ static DWORD WINAPI ReconThread(LPVOID)
     // Full self-discovery path
     {
         LibInfo lib = FindLibIl2CppBase();
-        if (!lib.valid) goto done;
+        // lib.valid may be false if the ELF header page was evicted.
+        // Stages 3b/5a/5b/6 do NOT need it -- continue regardless.
 
-        // ---- stage 3b: collect TTBR0 candidates ----------------------------
-        // Classic path (ELF header page, usually evicted): may give us
-        // load_bias_gva, enabling stage 4.  SONAME path collects all candidate
-        // TTBR0s without a backward walk -- game process identified in stage 5b.
+        // ---- stage 3b: TTBR0 candidates ----------------------------------
+        // lib.valid may be false if the ELF header page was evicted before
+        // the scan reached it.  Stages 3b/5a/5b/6 do NOT need LibInfo, so
+        // we proceed regardless.  Stage 4 and the classic TTBR0 path are
+        // guarded by lib.valid.
+        if (!lib.valid)
+            LOG("ELF header not found -- stages 3b+ continue without it");
+
         LOG("=== STAGE 3b: TTBR0 candidates ===");
         std::vector<PageTableInfo> ttbr0_list;
-        {
+        if (lib.valid) {
             PageTableInfo pt_classic = FindTTBR0(lib.elf_header_gpa);
             if (pt_classic.valid) {
                 LOG("  classic path: TTBR0=%016llX load_bias=%016llX",
@@ -1280,21 +1266,23 @@ static DWORD WINAPI ReconThread(LPVOID)
         }
         {
             RTGCPHYS soname_gpa = FindSonamePageGPA();
-            auto soname_ttbrs   = FindAllTTBR0Candidates(soname_gpa, lib);
+            auto soname_ttbrs   = FindAllTTBR0Candidates(soname_gpa);
             for (auto& t : soname_ttbrs) ttbr0_list.push_back(t);
         }
         LOG("  total TTBR0 candidates: %zu", ttbr0_list.size());
 
-        // ---- stage 4: exports (only when load_bias is known) ----------------
-        for (const auto& pt : ttbr0_list) {
-            if (pt.load_bias_gva != 0) {
-                LOG("=== STAGE 4: export RVAs ===");
-                ReadIl2CppExports(lib, pt);
-                break;
+        // ---- stage 4: exports (only when lib + load_bias available) ------
+        if (lib.valid) {
+            for (const auto& pt : ttbr0_list) {
+                if (pt.load_bias_gva != 0) {
+                    LOG("=== STAGE 4: export RVAs ===");
+                    ReadIl2CppExports(lib, pt);
+                    break;
+                }
             }
         }
 
-        // ---- stage 5: two-phase class discovery ----------------------------
+        // ---- stages 5a/5b/6: fully independent of LibInfo ---------------
         auto class_cands = ScanClassCandidates();
 
         FieldResult fields = FindLaneFieldsMulti(class_cands, ttbr0_list);
