@@ -33,12 +33,13 @@
  * ignored: unloading this DLL corrupts VMM state.
  */
 
+#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <set>
@@ -113,7 +114,7 @@ static uint32_t offTargetLane = FB_TARGET_LANE;
 static uint32_t offChanging = FB_CHANGING;
 
 // Bridge write export: available alongside the read export in BstkVMM.dll.
-typedef int (VBOXCALL *PFN_PGM_WRITE)(PUVM, uint64_t, const void*, size_t);
+typedef int (__cdecl *PFN_PGM_WRITE)(PUVM, uint64_t, const void*, size_t);
 static PFN_PGM_WRITE g_pfnWrite = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
