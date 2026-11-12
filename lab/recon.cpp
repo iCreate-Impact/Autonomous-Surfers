@@ -1,1009 +1,808 @@
 /*
- * recon.dll  v16  — stage 3a failure no longer fatal; full pipeline runs without ELF header
+ * recon_android11.cpp — guest-RAM lane reader for BlueStacks 5 / Android 11
  *
- * What changed from v15:
- *   BUG FIX: "libil2cpp.so not found" aborted the entire pipeline via
- *     "if (!lib.valid) goto done".  The ELF header page of libil2cpp.so
- *     is evicted quickly after mmap; if the DLL is injected after the game
- *     has been running for more than a few seconds, stage 3a never fires.
- *     Stages 3b/5a/5b/6 do not need LibInfo at all, so the goto done is
- *     removed.  Stage 3a data is used only where available (stage 4 and
- *     the classic ELF-header TTBR0 path remain guarded by lib.valid).
- *   FindAllTTBR0Candidates: unused LibInfo parameter removed.
+ * Six-stage pipeline (all self-discovered; no hard-coded session addresses):
  *
- * What was kept from v14->v15:
- *   Two-phase TTBR0 discovery (no PT_DYNAMIC backward walk).
- *   ClassCandidate struct, FieldResult.ttbr0, ScanClassCandidates,
- *   FindLaneFieldsMulti, GVA-aware TryReadFieldOffset/FindLaneGPA.
+ *   STAGE 1  VBox VMM bridge      BstkVMM.dll exports + UVM discovery
+ *   STAGE 2  guest RAM range map  PGM RAM-range list (corrected Android 11 layout)
+ *   STAGE 3  game address space   find "libil2cpp.so" in guest RAM and collect
+ *                                 the x86_64 CR3s that map it (batched parent
+ *                                 chain reconstruction)
+ *   STAGE 4  metadata + classes   locate the global-metadata header page in a
+ *                                 candidate CR3, derive the metadata base GVA
+ *                                 (virtual contiguity is verified with the
+ *                                 CharacterMotor / LaneStateInfo strings), then
+ *                                 find the Il2CppClass objects by name pointer
+ *   STAGE 5  player motor         strict CharacterMotor instance validation
+ *                                 (monitor==0, lane in range, bools, velocity)
+ *                                 and pick the input-driven player motor
+ *   STAGE 6  lane streaming       \\.\pipe\recon  LANE -1/0/1
  *
- * What was kept from v11->v12:
- *   - BotLoop() removed from the DLL. Bot logic lives in SubwayBot (VS project).
- *   - Named pipe server added: \\.\pipe\recon
- *   - DLL stays resident for the entire BlueStacks session. Never unload it.
- *   - DllMain ignores DLL_PROCESS_DETACH — detach path is intentionally a no-op
- *     to prevent VBox VMM state corruption on FreeLibrary.
+ * Field offsets are read from the live FieldInfo arrays by name, so this is
+ * not tied to the verified fallback constants (kept for diagnostics only).
  *
- * Protocol (all messages are newline-terminated ASCII):
+ * Pipe protocol (unchanged from recon.cpp v12):
+ *   SET_GPA <hex>\n   override the lane GPA       -> OK | ERR
+ *   READ\n            read the current lane       -> LANE <n> | LANE ? | ERR
+ *   START\n           stream LANE lines on change -> OK, then LANE lines
+ *   STOP\n            stop streaming              -> OK
+ *   PING\n                                        -> PONG
+ *   banner: STATUS READY HVA_BASE <hex>
  *
- *   Client -> DLL
- *   ─────────────
- *   PING\n                        heartbeat, DLL replies PONG\n
- *   SET_GPA <hex>\n               set lane GPA, DLL replies OK\n or ERR\n
- *   READ\n                        read current lane value, DLL replies LANE <n>\n
- *   HVA_BASE\n                    DLL replies HVA_BASE <hex>\n  (g_hvaBase this session)
- *   START\n                       begin streaming LANE <n>\n every 16ms until STOP
- *   STOP\n                        stop streaming
- *
- *   DLL -> Client (streaming)
- *   ─────────────────────────
- *   LANE -1\n   LEFT
- *   LANE  0\n   CENTER
- *   LANE  1\n   RIGHT
- *   LANE  ?\n   bad read (GPA stale — send new SET_GPA)
- *
- * Compile (VS x64 Native Tools prompt):
- *   cl /LD /O2 /EHsc recon.cpp /Fe:recon.dll /link /DLL psapi.lib
- *
- * Inject once per BlueStacks session. Never call FreeLibrary on it.
+ * Injected once per BlueStacks session.  DLL_PROCESS_DETACH is intentionally
+ * ignored: unloading this DLL corrupts VMM state.
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <psapi.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
-#include <vector>
+#include <math.h>
 #include <string>
+#include <vector>
+#include <set>
+#include <map>
 #include <atomic>
+#include <algorithm>
 
-// ── compile-time bypass ───────────────────────────────────────────────────────
-// Set to 0 to run full self-discovery (stages 3-6).
-// Set to CE_HVA - HCPtrStart for a quick bypass while self-discovery is WIP.
-#define DIRECT_LANE_GPA  0x0000000000000000ULL
+#include "x64_common.h"
 
-// ── pipe name ─────────────────────────────────────────────────────────────────
-#define PIPE_NAME  "\\\\.\\pipe\\recon"
+#define LOG_PATH  "X:\\Github\\Programmatic Control\\logs\\recon_android11.txt"
+#define PIPE_NAME "\\\\.\\pipe\\recon"
 
-// ── types ─────────────────────────────────────────────────────────────────────
+// global-metadata.dat v31 offsets (verified against the live APK metadata)
+static const uint64_t OFF_CM_NAME  = 0xE54E1ULL;   // "CharacterMotor"
+static const uint64_t OFF_CM_F0    = 0xE5FA8ULL;   // "MinimalVerticalSpeed"
+static const uint64_t OFF_LSI_NAME = 0xE649FULL;   // "LaneStateInfo"
+static const uint64_t OFF_LSI_F0   = 0xE629CULL;   // "IsChangingLane"
 
-typedef void*     PUVM;
-typedef void*     PVM;
-typedef uint64_t  RTGCPHYS;
+// Verified fallbacks for this build.  Runtime discovery is preferred.
+static const uint32_t FB_LANE_STATE  = 0x108;
+static const uint32_t FB_CONTROLLER  = 0xC0;
+static const uint32_t FB_CURRENT_ST  = 0x1A8;
+static const uint32_t FB_ALLOW_INPUT = 0x1D0;
+static const uint32_t FB_VELOCITY    = 0x1D4;
+static const uint32_t FB_IS_ACTIVE   = 0x1E8;
+static const uint32_t FB_ACCELERATE  = 0x1EA;
+// Verified live by probe 29: the inline LaneStateInfo struct starts at
+// CharacterMotor+0x108 and its first field is IsChangingLane (bool), with
+// TargetLane at +0x14 (so TargetLane sits at object+0x11C).  Values are
+// -1 / 0 / 1 for left / centre / right.
+static const uint32_t FB_TARGET_LANE = 0x14;
+static const uint32_t FB_CHANGING    = 0x00;
 
-typedef void*    (WINAPI* pfnVMR3GetUVM)               (PVM);
-typedef void*    (WINAPI* pfnVMR3GetVM)                (PUVM);
-typedef uint32_t (WINAPI* pfnPGMR3PhysGetRamRangeCount)(PVM);
-typedef int      (WINAPI* pfnPGMPhysSimpleReadGCPhys)  (PVM, void*, RTGCPHYS, size_t);
-typedef int      (WINAPI* pfnPGMPhysSimpleWriteGCPhys) (PVM, RTGCPHYS, const void*, size_t);
-
-// ── globals ───────────────────────────────────────────────────────────────────
-
-static const uint32_t UVM_MAGIC         = 0x19700823;
-static const uint32_t PGM_RANGES_OFFSET = 0x1010;
-static const uint64_t GUEST_RAM_BYTES   = 0xE0000000ULL;
-
-#define LOG_PATH "X:\\Github\\Autonomous Subway\\lab\\logs\\recon_out.txt"
-
-static pfnVMR3GetUVM                g_fnGetUVM;
-static pfnVMR3GetVM                 g_fnGetVM;
-static pfnPGMR3PhysGetRamRangeCount g_fnRangeCount;
-static pfnPGMPhysSimpleReadGCPhys   g_fnRead;
-static pfnPGMPhysSimpleWriteGCPhys  g_fnWrite;
-
-static FILE*    g_log     = nullptr;
-static void*    g_pVM     = nullptr;
-static PUVM     g_pUVM    = nullptr;
-static uint64_t g_hvaBase = 0;
-static uint64_t g_gpaBase = 0;
-
-// Shared state between recon thread and pipe clients.
-// Atomic so pipe thread can read/write without locks.
-static std::atomic<uint64_t> g_laneGpa { 0 };
-static std::atomic<bool>     g_streaming { false };
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared state
+// ─────────────────────────────────────────────────────────────────────────────
 static std::atomic<bool>     g_bridgeReady { false };
+static std::atomic<bool>     g_streaming   { false };
+static std::atomic<bool>     g_useUserGpa  { false };
+static std::atomic<uint64_t> g_userGpa     { 0 };
+static std::atomic<uint64_t> g_autoLaneGpa { 0 };
+static std::atomic<uint64_t> g_motorGpa    { 0 };
 
-// ── logging ───────────────────────────────────────────────────────────────────
+struct ClassInfo {
+    uint64_t gpa = 0;
+    uint64_t fields_gpa = 0;
+    uint64_t name_ptr = 0;
+    uint32_t fc = 0;
+    bool ok = false;
+};
 
-#define LOG(fmt, ...) do { \
-    if (g_log) { fprintf(g_log, fmt "\n", ##__VA_ARGS__); fflush(g_log); } \
-    char _b[512]; \
-    snprintf(_b, sizeof(_b), "[recon] " fmt "\n", ##__VA_ARGS__); \
-    OutputDebugStringA(_b); \
-} while(0)
+struct MetaCandidate { uint64_t cr3 = 0, base = 0; };
 
-// ── safe guest RAM read ───────────────────────────────────────────────────────
+static std::vector<uint64_t> g_cr3s;              // candidate game CR3s
+static std::vector<MetaCandidate> g_metas;        // validated metadata bases
+static uint64_t g_cr3 = 0;                        // selected game CR3
+static uint64_t g_metaBase = 0;
+static uint64_t g_metaCr3 = 0;
+static std::vector<uint64_t> g_magicGpas;
+static std::set<uint64_t> g_cmClassPtrs;
+static ClassInfo g_cm;
+static ClassInfo g_lsi;
 
-static bool GuestRead(RTGCPHYS gpa, void* dst, size_t cb)
+static uint32_t offLaneState = FB_LANE_STATE;
+static uint32_t offController = FB_CONTROLLER;
+static uint32_t offCurrentState = FB_CURRENT_ST;
+static uint32_t offAllowInput = FB_ALLOW_INPUT;
+static uint32_t offVelocity = FB_VELOCITY;
+static uint32_t offIsActive = FB_IS_ACTIVE;
+static uint32_t offAccelerate = FB_ACCELERATE;
+static uint32_t offTargetLane = FB_TARGET_LANE;
+static uint32_t offChanging = FB_CHANGING;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Guest RAM scanning
+// ─────────────────────────────────────────────────────────────────────────────
+static std::vector<uint64_t> FindStringHitsN(const char* needle, size_t nl,
+                                             size_t cap)
 {
-    if (gpa + cb > GUEST_RAM_BYTES) return false;
-    int rc = -1;
-    __try { rc = g_fnRead(g_pVM, dst, gpa, cb); }
-    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return rc == 0;
-}
-
-static bool GuestRead64(RTGCPHYS gpa, uint64_t* out) { return GuestRead(gpa, out, 8); }
-static bool GuestRead32(RTGCPHYS gpa, uint32_t* out) { return GuestRead(gpa, out, 4); }
-
-static std::string GuestReadStr(RTGCPHYS gpa, size_t max_len = 256)
-{
-    std::string s;
-    s.reserve(64);
-    for (size_t i = 0; i < max_len; i++) {
-        uint8_t c = 0;
-        if (!GuestRead(gpa + i, &c, 1)) break;
-        if (c == 0) break;
-        s += (char)c;
+    std::vector<uint64_t> out;
+    if (!nl) return out;
+    std::vector<uint8_t> buf(X64_CHUNK + 64);
+    for (const auto& r : g_x64Ranges) {
+        for (uint64_t pos = r.start; pos <= r.end; ) {
+            uint64_t left = r.end - pos + 1;
+            size_t n = (size_t)((left < X64_CHUNK) ? left : X64_CHUNK);
+            size_t n2 = (size_t)((left < (uint64_t)(X64_CHUNK + 64)) ? left
+                                                                    : (uint64_t)(X64_CHUNK + 64));
+            GuestReadRobust(pos, buf.data(), n2);
+            for (size_t off = 0; off < n && off + nl <= n2; off++) {
+                if (buf[off] != (uint8_t)needle[0]) continue;
+                if (memcmp(buf.data() + off, needle, nl) != 0) continue;
+                out.push_back(pos + off);
+                if (cap && out.size() >= cap) return out;
+            }
+            pos += n;
+        }
     }
-    return s;
+    return out;
 }
 
-static void Prefault(void* base, size_t size)
+static std::vector<uint64_t> FindMetaMagicGpas()
 {
-    volatile uint8_t* p = (volatile uint8_t*)base;
-    size_t pages = (size + 0xFFF) / 0x1000;
-    for (size_t i = 0; i < pages; i++)
-        __try { (void)p[i * 0x1000]; } __except(EXCEPTION_EXECUTE_HANDLER) {}
-}
-
-// ── ARM64 page table walk ─────────────────────────────────────────────────────
-//
-// 39-bit VA (Android default), 4KB pages, 3 levels.
-//   VA[38:30] -> PGD index  (9 bits, 512 entries)
-//   VA[29:21] -> PMD index  (9 bits, 512 entries)
-//   VA[20:12] -> PTE index  (9 bits, 512 entries)
-//   VA[11:0]  -> page offset
-
-static const uint64_t ARM64_OA_MASK  = 0x0000FFFFFFFFF000ULL;
-static const uint64_t ARM64_VALID    = 0x3ULL;
-
-static bool IsValidDescriptor(uint64_t e)
-{
-    return (e & ARM64_VALID) == ARM64_VALID &&
-           (e & ARM64_OA_MASK) != 0 &&
-           (e & ARM64_OA_MASK) < GUEST_RAM_BYTES;
-}
-
-static bool GvaToGpa(uint64_t ttbr0, uint64_t gva, RTGCPHYS* out_gpa)
-{
-    uint64_t pgd_idx = (gva >> 30) & 0x1FF;
-    uint64_t pmd_idx = (gva >> 21) & 0x1FF;
-    uint64_t pte_idx = (gva >> 12) & 0x1FF;
-    uint64_t pg_off  = gva & 0xFFF;
-
-    uint64_t pgd_e = 0;
-    if (!GuestRead64(ttbr0 + pgd_idx * 8, &pgd_e)) return false;
-    if (!IsValidDescriptor(pgd_e)) return false;
-    uint64_t pmd_page = pgd_e & ARM64_OA_MASK;
-
-    uint64_t pmd_e = 0;
-    if (!GuestRead64(pmd_page + pmd_idx * 8, &pmd_e)) return false;
-    if (!IsValidDescriptor(pmd_e)) return false;
-
-    if ((pmd_e & 0x3) == 0x1) {
-        uint64_t block_pa = pmd_e & 0xFFFFFFFE00000ULL;
-        *out_gpa = block_pa | (gva & 0x1FFFFF);
-        return *out_gpa < GUEST_RAM_BYTES;
+    static const uint8_t MAGIC[8] = { 0xAF, 0x1B, 0xB1, 0xFA, 0x1F, 0, 0, 0 };
+    std::vector<uint64_t> out;
+    std::vector<uint8_t> buf(X64_CHUNK);
+    for (const auto& r : g_x64Ranges) {
+        for (uint64_t pos = r.start; pos <= r.end; ) {
+            uint64_t left = r.end - pos + 1;
+            size_t n = (size_t)((left < X64_CHUNK) ? left : X64_CHUNK);
+            GuestReadRobust(pos, buf.data(), n);
+            for (size_t off = 0; off + 8 <= n; off++)
+                if (!memcmp(buf.data() + off, MAGIC, 8)) {
+                    out.push_back(pos + off);
+                    if (out.size() >= 8) return out;
+                }
+            pos += n;
+        }
     }
-    uint64_t pte_page = pmd_e & ARM64_OA_MASK;
-
-    uint64_t pte_e = 0;
-    if (!GuestRead64(pte_page + pte_idx * 8, &pte_e)) return false;
-    if (!IsValidDescriptor(pte_e)) return false;
-
-    *out_gpa = (pte_e & ARM64_OA_MASK) | pg_off;
-    return *out_gpa < GUEST_RAM_BYTES;
+    return out;
 }
 
-static std::string GvaReadStr(uint64_t ttbr0, uint64_t gva, size_t max_len = 256)
+static uint64_t FindMetaMagicGpa() { auto v = FindMetaMagicGpas(); return v.empty() ? 0 : v[0]; }
+
+static std::vector<uint64_t> FindQwordsAny(const std::set<uint64_t>& values,
+                                           size_t cap = 4096)
 {
-    std::string s;
-    s.reserve(64);
-    for (size_t i = 0; i < max_len; i++) {
-        RTGCPHYS gpa = 0;
-        if (!GvaToGpa(ttbr0, gva + i, &gpa)) break;
-        uint8_t c = 0;
-        if (!GuestRead(gpa, &c, 1)) break;
-        if (c == 0) break;
-        s += (char)c;
+    std::vector<uint64_t> out;
+    uint64_t vmin = UINT64_MAX, vmax = 0;
+    for (uint64_t v : values) { vmin = std::min(vmin, v); vmax = std::max(vmax, v); }
+    std::vector<uint8_t> buf(X64_CHUNK);
+    for (const auto& r : g_x64Ranges) {
+        for (uint64_t pos = r.start; pos <= r.end; ) {
+            uint64_t left = r.end - pos + 1;
+            size_t n = (size_t)((left < X64_CHUNK) ? left : X64_CHUNK);
+            GuestReadRobust(pos, buf.data(), n);
+            const uint64_t* q = (const uint64_t*)buf.data();
+            for (size_t i = 0; i < n / 8; i++) {
+                uint64_t v = q[i];
+                if (v < vmin || v > vmax) continue;
+                if (!values.count(v)) continue;
+                out.push_back(pos + (uint64_t)i * 8);
+                if (cap && out.size() >= cap) return out;
+            }
+            pos += n;
+        }
     }
-    return s;
+    return out;
 }
 
-static bool GvaRead(uint64_t ttbr0, uint64_t gva, void* dst, size_t cb)
+// ─────────────────────────────────────────────────────────────────────────────
+// Batched page-table chain reconstruction
+// ─────────────────────────────────────────────────────────────────────────────
+struct EntryHit { uint64_t child; uint64_t loc; };
+
+static std::vector<EntryHit> FindParentEntries(const std::set<uint64_t>& childPages)
 {
-    uint8_t* p = (uint8_t*)dst;
-    for (size_t i = 0; i < cb; ) {
-        RTGCPHYS gpa = 0;
-        if (!GvaToGpa(ttbr0, gva + i, &gpa)) return false;
-        size_t page_rem = 0x1000 - (gpa & 0xFFF);
-        size_t chunk    = (cb - i < page_rem) ? (cb - i) : page_rem;
-        if (!GuestRead(gpa, p + i, chunk)) return false;
-        i += chunk;
+    std::vector<EntryHit> out;
+    if (childPages.empty()) return out;
+    std::vector<uint8_t> buf(X64_CHUNK);
+    for (const auto& r : g_x64Ranges) {
+        for (uint64_t pos = r.start; pos <= r.end; ) {
+            uint64_t left = r.end - pos + 1;
+            size_t n = (size_t)((left < X64_CHUNK) ? left : X64_CHUNK);
+            GuestReadRobust(pos, buf.data(), n);
+            const uint64_t* q = (const uint64_t*)buf.data();
+            for (size_t i = 0; i < n / 8; i++) {
+                uint64_t e = q[i];
+                if (!(e & 1) || (e & 0x80)) continue;
+                uint64_t frame = e & X64_PHYS_4K;
+                if (!childPages.count(frame)) continue;
+                out.push_back({ frame, pos + (uint64_t)i * 8 });
+            }
+            pos += n;
+        }
     }
-    return true;
+    return out;
 }
 
-static bool GvaRead64(uint64_t ttbr0, uint64_t gva, uint64_t* out) { return GvaRead(ttbr0, gva, out, 8); }
-static bool GvaRead32(uint64_t ttbr0, uint64_t gva, uint32_t* out) { return GvaRead(ttbr0, gva, out, 4); }
+struct LeafRef { uint64_t frame; uint64_t off; };
+struct ChainRef { uint64_t cr3; uint64_t gva; };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 1 — VBox bridge
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static bool InitVBoxBridge()
+static std::vector<ChainRef> ChainsForLeaves(const std::vector<LeafRef>& leaves,
+                                             size_t cap = 16384)
 {
-    HMODULE hVMM = GetModuleHandleA("BstkVMM.dll");
-    if (!hVMM) { LOG("BstkVMM.dll not found"); return false; }
+    std::vector<ChainRef> out;
+    std::set<uint64_t> frames;
+    for (const auto& l : leaves) frames.insert(l.frame);
+    auto ptes = FindParentEntries(frames);
+    if (ptes.empty()) return out;
 
-#define RESOLVE(name, type, var) \
-    var = (type)GetProcAddress(hVMM, #name); \
-    if (!var) { LOG("missing export " #name); return false; } \
-    LOG(#name " = %p", (void*)var);
+    struct Partial { uint64_t idx[4]; uint64_t page; uint64_t frame; uint64_t off; };
+    std::vector<Partial> cur;
+    for (const auto& e : ptes)
+        for (const auto& l : leaves) {
+            if (l.frame != e.child) continue;
+            Partial p = {};
+            p.idx[0] = (e.loc & 0xFFF) / 8;
+            p.page = e.loc & ~0xFFFULL;
+            p.frame = l.frame;
+            p.off = l.off;
+            cur.push_back(p);
+        }
 
-    RESOLVE(VMR3GetUVM,                pfnVMR3GetUVM,                g_fnGetUVM)
-    RESOLVE(VMR3GetVM,                 pfnVMR3GetVM,                 g_fnGetVM)
-    RESOLVE(PGMR3PhysGetRamRangeCount, pfnPGMR3PhysGetRamRangeCount, g_fnRangeCount)
-    RESOLVE(PGMPhysSimpleReadGCPhys,   pfnPGMPhysSimpleReadGCPhys,   g_fnRead)
-    RESOLVE(PGMPhysSimpleWriteGCPhys,  pfnPGMPhysSimpleWriteGCPhys,  g_fnWrite)
-#undef RESOLVE
-    return true;
+    for (int level = 1; level <= 3 && !cur.empty(); level++) {
+        std::set<uint64_t> pages;
+        for (const auto& p : cur) pages.insert(p.page);
+        auto parents = FindParentEntries(pages);
+        if (parents.empty()) { cur.clear(); break; }
+        std::map<uint64_t, std::vector<uint64_t>> byChild;
+        for (const auto& e : parents) byChild[e.child].push_back(e.loc);
+        std::vector<Partial> next;
+        for (const auto& p : cur) {
+            auto it = byChild.find(p.page);
+            if (it == byChild.end()) continue;
+            for (uint64_t loc : it->second) {
+                Partial np = p;
+                np.idx[level] = (loc & 0xFFF) / 8;
+                np.page = loc & ~0xFFFULL;
+                next.push_back(np);
+                if (next.size() >= cap) break;
+            }
+            if (next.size() >= cap) break;
+        }
+        cur.swap(next);
+    }
+
+    std::set<std::pair<uint64_t, uint64_t>> seen;
+    for (const auto& p : cur) {
+        uint64_t gva = ((p.idx[3] & 0x1FF) << 39) | ((p.idx[2] & 0x1FF) << 30) |
+                       ((p.idx[1] & 0x1FF) << 21) | ((p.idx[0] & 0x1FF) << 12) |
+                       (p.off & 0xFFF);
+        if (!seen.insert({p.page, gva}).second) continue;
+        uint64_t chk = 0;
+        if (!X64Translate(p.page, gva, &chk, nullptr)) continue;
+        if ((chk & ~0xFFFULL) != p.frame) continue;
+        out.push_back({ p.page, gva });
+    }
+    return out;
 }
 
-static bool ScanForUVM()
+// Forward walk of one CR3: every GVA (page base) mapping any target page.
+static std::map<uint64_t, std::vector<uint64_t>>
+WalkCr3ForPages(uint64_t cr3, const std::set<uint64_t>& pages)
 {
-    SYSTEM_INFO si = {}; GetSystemInfo(&si);
-    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
-    uintptr_t end  = (uintptr_t)si.lpMaximumApplicationAddress;
-
-    while (addr < end) {
-        MEMORY_BASIC_INFORMATION mbi = {};
-        if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) { addr += 0x1000; continue; }
-        size_t rSize = mbi.RegionSize;
-
-        if (mbi.State == MEM_COMMIT &&
-            (mbi.Protect & 0xFF) != PAGE_NOACCESS &&
-            (mbi.Protect & 0xFF) != PAGE_EXECUTE  &&
-            !(mbi.Protect & PAGE_GUARD) &&
-            mbi.Type != MEM_IMAGE && rSize >= 4)
-        {
-            uintptr_t rBase = (uintptr_t)mbi.BaseAddress;
-            uintptr_t rEnd  = rBase + rSize;
-            uintptr_t pg    = (rBase + 0xFFF) & ~(uintptr_t)0xFFF;
-
-            while (pg + 4 <= rEnd) {
-                __try {
-                    if (*(uint32_t*)pg == UVM_MAGIC) {
-                        void* pvm = nullptr;
-                        __try { pvm = *(void**)(pg + 8); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                        if (!pvm) { pg += 0x1000; continue; }
-
-                        void* gotPVM = nullptr; PUVM gotUVM = nullptr;
-                        __try { gotPVM = g_fnGetVM((PUVM)pg); }   __except(EXCEPTION_EXECUTE_HANDLER) {}
-                        __try { gotUVM = g_fnGetUVM(pvm); }        __except(EXCEPTION_EXECUTE_HANDLER) {}
-                        if (gotPVM != pvm || gotUVM != (PUVM)pg) { pg += 0x1000; continue; }
-
-                        Prefault(pvm, 0x2000);
-                        uint32_t rc = 0;
-                        __try { rc = g_fnRangeCount((PVM)pvm); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                        if (rc >= 1 && rc <= 128) {
-                            g_pUVM = (PUVM)pg;
-                            g_pVM  = pvm;
-                            LOG("pUVM=%p  pVM=%p  nRanges=%u", (void*)pg, pvm, rc);
-                            return true;
-                        }
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                pg += 0x1000;
+    std::map<uint64_t, std::vector<uint64_t>> out;
+    std::set<uint64_t> p2m, p1g;
+    for (uint64_t p : pages) { p2m.insert(p & X64_PHYS_2M); p1g.insert(p & X64_PHYS_1G); }
+    for (uint64_t i4 = 0; i4 < 512; i4++) {
+        uint64_t e4 = 0;
+        if (!GuestRead64(cr3 + i4 * 8, &e4) || !(e4 & 1)) continue;
+        uint64_t pdpt = e4 & X64_PHYS_4K;
+        for (uint64_t i3 = 0; i3 < 512; i3++) {
+            uint64_t e3 = 0;
+            if (!GuestRead64(pdpt + i3 * 8, &e3) || !(e3 & 1)) continue;
+            if (e3 & 0x80) {
+                uint64_t blk = e3 & X64_PHYS_1G;
+                if (!p1g.count(blk)) continue;
+                for (uint64_t p : pages)
+                    if ((p & X64_PHYS_1G) == blk)
+                        out[p].push_back((i4 << 39) | (i3 << 30) | (p & 0x3FFFFFFFULL));
+                continue;
+            }
+            uint64_t pd = e3 & X64_PHYS_4K;
+            for (uint64_t i2 = 0; i2 < 512; i2++) {
+                uint64_t e2 = 0;
+                if (!GuestRead64(pd + i2 * 8, &e2) || !(e2 & 1)) continue;
+                if (e2 & 0x80) {
+                    uint64_t blk = e2 & X64_PHYS_2M;
+                    if (!p2m.count(blk)) continue;
+                    for (uint64_t p : pages)
+                        if ((p & X64_PHYS_2M) == blk)
+                            out[p].push_back((i4 << 39) | (i3 << 30) | (i2 << 21) |
+                                             (p & 0x1FFFFFULL));
+                    continue;
+                }
+                uint64_t pt = e2 & X64_PHYS_4K;
+                for (uint64_t i1 = 0; i1 < 512; i1++) {
+                    uint64_t e1 = 0;
+                    if (!GuestRead64(pt + i1 * 8, &e1) || !(e1 & 1)) continue;
+                    uint64_t frame = e1 & X64_PHYS_4K;
+                    if (!pages.count(frame)) continue;
+                    out[frame].push_back((i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12));
+                }
             }
         }
-        addr += rSize;
     }
-    LOG("UVM scan failed");
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGE 1/2 — bridge + corrected Android 11 range map
+// ─────────────────────────────────────────────────────────────────────────────
+static bool Stage1Bridge()
+{
+    LOG("=== STAGE 1: VBox VMM bridge ===");
+    if (!InitVBoxBridge()) { LOG("bridge: BstkVMM exports missing"); return false; }
+    if (!ScanForUVM())     { LOG("bridge: UVM not found"); return false; }
+    LOG("bridge ready: pVM=%p ranges=%u", g_pVM, g_nRanges);
+    return true;
+}
+
+static bool Stage2Ranges()
+{
+    LOG("=== STAGE 2: guest RAM range map ===");
+    std::vector<GuestRange> all = ReadGuestRanges();
+    g_x64Ranges.clear();
+    for (const auto& r : all) {
+        LOG("  range %016llX-%016llX %6llu MB  %s",
+            (unsigned long long)r.start, (unsigned long long)r.end,
+            (unsigned long long)((r.end - r.start + 1) >> 20), r.desc);
+        if (r.end - r.start + 1 >= 0x100000ULL)
+            g_x64Ranges.push_back(r);
+    }
+    if (g_x64Ranges.empty()) { LOG("range map: no RAM-like ranges"); return false; }
+    g_x64Ceiling = g_x64Ranges.back().end + 1;
+    uint64_t total = 0;
+    for (const auto& r : g_x64Ranges) total += r.end - r.start + 1;
+    LOG("range map: %zu RAM ranges, %llu MB, ceiling %016llX",
+        g_x64Ranges.size(), (unsigned long long)(total >> 20),
+        (unsigned long long)g_x64Ceiling);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGE 3 — candidate game address spaces (CR3s mapping libil2cpp.so)
+// ─────────────────────────────────────────────────────────────────────────────
+static bool Stage3Cr3s()
+{
+    LOG("=== STAGE 3: game address spaces ===");
+    static const char NEEDLE[] = "libil2cpp.so";
+    size_t nl = sizeof(NEEDLE);   // includes the NUL terminator
+    auto hits = FindStringHitsN(NEEDLE, nl, 1024);
+    LOG("stage 3: %zu exact \"libil2cpp.so\" strings", hits.size());
+    if (hits.empty()) return false;
+
+    std::vector<LeafRef> leaves;
+    for (uint64_t p : hits) leaves.push_back({ p & ~0xFFFULL, p & 0xFFF });
+
+    auto chains = ChainsForLeaves(leaves, 32768);
+    LOG("stage 3: %zu candidate (cr3,gva) mappings", chains.size());
+
+    std::set<uint64_t> cr3s;
+    for (const auto& c : chains) {
+        if (X64ReadString(c.cr3, c.gva, 16) != "libil2cpp.so") continue;
+        cr3s.insert(c.cr3);
+    }
+    g_cr3s.assign(cr3s.begin(), cr3s.end());
+    LOG("stage 3: %zu distinct CR3s map the soname", g_cr3s.size());
+    for (uint64_t c : g_cr3s)
+        LOG("  CR3=%016llX", (unsigned long long)c);
+    return !g_cr3s.empty();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGE 4 — metadata base + il2cpp classes
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string ClassNameAt(uint64_t cr3, uint64_t gva)
+{
+    uint64_t gpa = 0;
+    if (!gva || !X64Translate(cr3, gva, &gpa, nullptr)) return "";
+    uint64_t klass = 0;
+    if (!GuestRead64(gpa, &klass) || !klass) return "";
+    uint64_t kgpa = 0;
+    if (!X64Translate(cr3, klass, &kgpa, nullptr)) return "";
+    uint64_t name = 0;
+    GuestRead64(kgpa + 0x10, &name);
+    return X64ReadString(cr3, name, 64);
+}
+
+static uint32_t FindFieldOffsetByName(uint64_t cr3, const ClassInfo& ci,
+                                      const char* name, uint32_t fallback)
+{
+    if (!ci.fields_gpa) return fallback;   // FieldInfo array paged out
+    for (uint32_t i = 0; i < ci.fc; i++) {
+        uint64_t nm = 0;
+        if (!GuestRead64(ci.fields_gpa + (uint64_t)i * 0x20, &nm)) break;
+        if (X64ReadString(cr3, nm, 64) == name) {
+            uint32_t off = 0;
+            GuestRead32(ci.fields_gpa + (uint64_t)i * 0x20 + 0x18, &off);
+            return off;
+        }
+    }
+    return fallback;
+}
+
+static int FindFieldIndexByName(uint64_t cr3, const ClassInfo& ci, const char* name)
+{
+    if (!ci.fields_gpa) return -1;
+    for (uint32_t i = 0; i < ci.fc; i++) {
+        uint64_t nm = 0;
+        if (!GuestRead64(ci.fields_gpa + (uint64_t)i * 0x20, &nm)) break;
+        if (X64ReadString(cr3, nm, 64) == name) return (int)i;
+    }
+    return -1;
+}
+
+// Load an Il2CppClass given its guest-physical address (no name validation).
+static bool LoadClassAt(uint64_t cr3, uint64_t clsGpa, ClassInfo* out)
+{
+    uint64_t name = 0, fields = 0, fgpa = 0;
+    uint16_t fc = 0;
+    GuestRead64(clsGpa + 0x10, &name);
+    GuestRead64(clsGpa + 0x80, &fields);
+    GuestRead(clsGpa + 0x124, &fc, 2);
+    if (!name || !fields || !fc) return false;
+    if (!X64Translate(cr3, fields, &fgpa, nullptr)) return false;
+    out->gpa = clsGpa;
+    out->fields_gpa = fgpa;
+    out->name_ptr = name;
+    out->fc = fc;
+    out->ok = true;
+    return true;
+}
+
+static bool ValidateClassAt(uint64_t cr3, uint64_t loc, uint64_t namePtr,
+                            uint32_t wantFc, const char* f0name, ClassInfo* out)
+{
+    if (loc < 0x10) return false;
+    uint64_t cls = loc - 0x10;
+    uint64_t name = 0, fields = 0, f0 = 0, fgpa = 0;
+    uint16_t fc = 0;
+    GuestRead64(cls + 0x10, &name);
+    GuestRead64(cls + 0x80, &fields);
+    GuestRead(cls + 0x124, &fc, 2);
+    if (name != namePtr || !fields || fc != wantFc) return false;
+    // The FieldInfo array is native heap memory and Android may swap it out
+    // (probe 31: the PTE's present bit is clear), in which case translating
+    // `fields` fails even though the class itself is resident.  Then accept
+    // on name pointer + field count alone and keep the verified inline
+    // offsets (the caller's fallbacks).
+    if (X64Translate(cr3, fields, &fgpa, nullptr)) {
+        GuestRead64(fgpa, &f0);
+        // The FieldInfo array may be resident while the metadata string page
+        // holding the field names is paged out.  An empty read is "unknown",
+        // not a mismatch, so only reject on a non-empty wrong name.
+        if (f0name && f0) {
+            std::string f0s = X64ReadString(cr3, f0, 48);
+            if (!f0s.empty() && f0s != f0name) return false;
+        }
+        out->gpa = cls;
+        out->fields_gpa = fgpa;
+        out->name_ptr = namePtr;
+        out->fc = fc;
+        out->ok = true;
+        return true;
+    }
+    out->gpa = cls;
+    out->fields_gpa = 0;
+    out->name_ptr = namePtr;
+    out->fc = fc;
+    out->ok = true;
+    return true;
+}
+
+// Find the metadata base GVA inside one CR3 by mapping the metadata magic
+// page.  The class-name strings are NOT read here: Android may page out the
+// metadata file pages (probe 32: strings returned "", magic page resident),
+// so the base is taken from the page-aligned magic GVA and validated later by
+// finding CharacterMotor name pointers at base+OFF_CM_NAME.
+static bool FindMetaBaseInCr3(uint64_t cr3, uint64_t magicGpa, uint64_t* outBase)
+{
+    if (!magicGpa) return false;
+    uint64_t page = magicGpa & ~0xFFFULL;
+    auto w = WalkCr3ForPages(cr3, { page });
+    auto it = w.find(page);
+    if (it == w.end()) return false;
+
+    for (uint64_t g : it->second) {
+        if (g >= 0x800000000000ULL) continue;   // user space only
+        uint64_t m0 = g | (magicGpa & 0xFFF);
+        uint64_t cand[2] = { m0, g };
+        for (uint64_t m : cand) {
+            uint64_t mgpa = 0;
+            uint32_t magic = 0;
+            if (!X64Translate(cr3, m, &mgpa, nullptr)) continue;
+            if (!GuestRead32(mgpa, &magic) || magic != 0xFAB11BAF) continue;
+            if (m & 0xFFF) continue;            // magic is at file offset 0
+            *outBase = m;
+            return true;
+        }
+    }
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 2 — Map the flat guest RAM range
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static bool InitRangeMap()
+static bool Stage4ClassesOnce()
 {
-    uintptr_t headPtr = 0;
-    __try { headPtr = *(uintptr_t*)((uintptr_t)g_pVM + PGM_RANGES_OFFSET); }
-    __except(EXCEPTION_EXECUTE_HANDLER) { LOG("pVM+0x1010 read threw"); return false; }
-    if (!headPtr) { LOG("pRamRangesXR3 is null"); return false; }
-    LOG("pRamRangesXR3 = %p", (void*)headPtr);
+    LOG("=== STAGE 4: metadata + il2cpp classes ===");
 
-    Prefault((void*)headPtr, 0x200);
-    uint32_t nextOff = 0;
-    for (uint32_t off = 0x20; off <= 0x100; off += 8) {
-        uintptr_t candidate = 0;
-        __try { candidate = *(uintptr_t*)(headPtr + off); }
-        __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
-        if (candidate == 0) { if (!nextOff) nextOff = off; break; }
-        if ((candidate >> 48) != 0 && (candidate >> 48) != 0xFFFF) continue;
-        uint64_t t0 = 0;
-        __try { t0 = *(uint64_t*)candidate; } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
-        if (t0 == 0 || (t0 < 0x100000000ULL && (t0 & 0xFFF) == 0)) {
-            if (!nextOff) nextOff = off;
-            break;
-        }
-    }
-    if (!nextOff) nextOff = 0x38;
-    LOG("pNextR3 offset = +0x%02X", nextOff);
-
-    uintptr_t node = headPtr;
-    for (int idx = 0; node && idx < 64; idx++) {
-        Prefault((void*)node, 0x200);
-        uint64_t gcStart = 0, gcEnd = 0, hcPtr = 0;
-        __try {
-            gcStart = *(uint64_t*)(node + 0x00);
-            gcEnd   = *(uint64_t*)(node + 0x08);
-            hcPtr   = *(uint64_t*)(node + 0x10);
-        } __except(EXCEPTION_EXECUTE_HANDLER) { break; }
-
-        uint64_t sz = (gcEnd >= gcStart) ? (gcEnd - gcStart + 1) : 0;
-        LOG("range[%d]  GC:%016llX-%016llX  HC:%016llX  %8.2f MB",
-            idx, (unsigned long long)gcStart, (unsigned long long)gcEnd,
-            (unsigned long long)hcPtr, sz / (1024.0 * 1024.0));
-
-        if (gcStart == 0 && sz >= 0x10000000ULL) {
-            g_hvaBase = hcPtr;
-            g_gpaBase = gcStart;
-            LOG("guest RAM base: HVA=%016llX  GPA=%016llX  size=%.2f GB",
-                (unsigned long long)hcPtr, (unsigned long long)gcStart,
-                sz / (1024.0 * 1024.0 * 1024.0));
-            LOG("CE->GPA formula: GPA = CE_HVA - %016llX", (unsigned long long)hcPtr);
-        }
-
-        uintptr_t next = 0;
-        __try { next = *(uintptr_t*)(node + nextOff); } __except(EXCEPTION_EXECUTE_HANDLER) { break; }
-        node = next;
+    if (g_magicGpas.empty()) {
+        g_magicGpas = FindMetaMagicGpas();
+        LOG("stage 4: %zu metadata magic copies", g_magicGpas.size());
+        for (uint64_t m : g_magicGpas)
+            LOG("  magic GPA=%016llX", (unsigned long long)m);
+        if (g_magicGpas.empty()) return false;
     }
 
-    if (!g_hvaBase) { LOG("failed to find main guest RAM range"); return false; }
-    return true;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 3-6 stubs — same as v11, condensed here for clarity
-// (ELF scan, TTBR0 walk, export read, field scan, instance scan)
-// These only run when DIRECT_LANE_GPA == 0.
-// ═══════════════════════════════════════════════════════════════════════════════
-
-struct Elf64Hdr {
-    uint8_t  e_ident[16]; uint16_t e_type; uint16_t e_machine;
-    uint32_t e_version;   uint64_t e_entry; uint64_t e_phoff;
-    uint64_t e_shoff;     uint32_t e_flags; uint16_t e_ehsize;
-    uint16_t e_phentsize; uint16_t e_phnum; uint16_t e_shentsize;
-    uint16_t e_shnum;     uint16_t e_shstrndx;
-};
-struct Elf64Phdr {
-    uint32_t p_type; uint32_t p_flags; uint64_t p_offset;
-    uint64_t p_vaddr; uint64_t p_paddr; uint64_t p_filesz;
-    uint64_t p_memsz; uint64_t p_align;
-};
-struct Elf64Sym {
-    uint32_t st_name; uint8_t st_info; uint8_t st_other;
-    uint16_t st_shndx; uint64_t st_value; uint64_t st_size;
-};
-struct Elf64Dyn { int64_t d_tag; uint64_t d_val; };
-
-#define PT_LOAD    1
-#define PT_DYNAMIC 2
-#define DT_NULL    0
-#define DT_HASH    4
-#define DT_STRTAB  5
-#define DT_SYMTAB  6
-#define DT_STRSZ   10
-#define DT_SYMENT  11
-#define DT_SONAME  14
-
-struct LibInfo {
-    RTGCPHYS elf_header_gpa;
-    uint64_t load0_vaddr, load0_offset;
-    uint64_t dyn_vaddr, dyn_offset, dyn_filesz;
-    uint16_t phnum;
-    bool valid;
-};
-
-static LibInfo FindLibIl2CppBase()
-{
-    LibInfo result = {};
-    LOG("=== STAGE 3a: ELF header scan ===");
-    LOG("scan range GPA 0x1000000-0x%08llX (step 4KB)",
-        (unsigned long long)GUEST_RAM_BYTES);
-
-    uint8_t page[16];
-    uint32_t candidates = 0;
-    static const uint8_t ELF_MAGIC[4] = { 0x7f, 'E', 'L', 'F' };
-
-    // v12: lowered scan floor to 0x1000000 to catch headers below 0x10000000
-    for (RTGCPHYS gpa = 0x1000000ULL; gpa < GUEST_RAM_BYTES; gpa += 0x1000) {
-        if ((gpa & 0x0FFFFFFF) == 0)
-            LOG("  ELF scan: GPA=%016llX", (unsigned long long)gpa);
-
-        if (!GuestRead(gpa, page, 16)) continue;
-        if (memcmp(page, ELF_MAGIC, 4) != 0) continue;
-        if (page[4] != 2) continue;
-        if (page[5] != 1) continue;
-
-        Elf64Hdr hdr;
-        if (!GuestRead(gpa, &hdr, sizeof(hdr))) continue;
-        if (hdr.e_type    != 3)   continue;
-        if (hdr.e_machine != 183) continue;
-        if (hdr.e_phnum == 0 || hdr.e_phnum > 128) continue;
-        if (hdr.e_phoff  == 0) continue;
-        if (hdr.e_phentsize != sizeof(Elf64Phdr)) continue;
-
-        LibInfo li = {};
-        li.elf_header_gpa = gpa;
-        li.phnum          = hdr.e_phnum;
-        li.load0_vaddr    = UINT64_MAX;
-        bool has_dyn = false;
-
-        for (uint16_t pi = 0; pi < hdr.e_phnum; pi++) {
-            Elf64Phdr ph;
-            RTGCPHYS ph_gpa = gpa + hdr.e_phoff + (uint64_t)pi * sizeof(Elf64Phdr);
-            if (!GuestRead(ph_gpa, &ph, sizeof(ph))) continue;
-            if (ph.p_type == PT_LOAD && ph.p_vaddr < li.load0_vaddr) {
-                li.load0_vaddr  = ph.p_vaddr;
-                li.load0_offset = ph.p_offset;
-            }
-            if (ph.p_type == PT_DYNAMIC) {
-                has_dyn      = true;
-                li.dyn_vaddr = ph.p_vaddr;
-                li.dyn_offset= ph.p_offset;
-                li.dyn_filesz= ph.p_filesz;
-            }
-        }
-
-        if (!has_dyn) continue;
-        if (li.load0_vaddr == UINT64_MAX) li.load0_vaddr = 0;
-
-        candidates++;
-        LOG("  ARM64 ET_DYN @ GPA=%016llX  phnum=%u  dyn_offset=0x%llX (%.1f MB)",
-            (unsigned long long)gpa, hdr.e_phnum,
-            (unsigned long long)li.dyn_offset,
-            (double)li.dyn_offset / (1024.0 * 1024.0));
-
-        // libil2cpp.so: PT_DYNAMIC lives >64 MB into the file — unique fingerprint.
-        if (li.dyn_offset >= 0x4000000ULL) {
-            LOG("  dyn_vaddr=0x%016llX  load0_vaddr=0x%016llX  dyn_offset_in_va=0x%016llX",
-                (unsigned long long)li.dyn_vaddr, (unsigned long long)li.load0_vaddr,
-                (unsigned long long)(li.dyn_vaddr - li.load0_vaddr));
-            LOG("  IDENTIFIED libil2cpp.so (dyn_offset %.1f MB > 64 MB threshold)",
-                (double)li.dyn_offset / (1024.0 * 1024.0));
-            li.valid = true;
-            return li;
-        }
-    }
-
-    LOG("libil2cpp.so not found (%u candidates checked)", candidates);
-    return result;
-}
-
-struct PageTableInfo { uint64_t ttbr0, load_bias_gva; bool valid; };
-
-static PageTableInfo FindTTBR0(RTGCPHYS elf_header_gpa)
-{
-    PageTableInfo result = {};
-    LOG("=== STAGE 3b: reverse PTE scan for GPA=%016llX ===",
-        (unsigned long long)elf_header_gpa);
-
-    uint64_t target_oa = elf_header_gpa & ARM64_OA_MASK;
-    std::vector<RTGCPHYS> pte_locs;
-    pte_locs.reserve(16);
-
-    LOG("  pass 1: scanning for PTEs with OA=%016llX ...", (unsigned long long)target_oa);
-    for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-        if ((gpa & 0x0FFFFFFF) == 0)
-            LOG("  PTE scan progress: GPA=%016llX", (unsigned long long)gpa);
-        uint64_t e = 0;
-        if (!GuestRead64(gpa, &e)) continue;
-        if ((e & ARM64_OA_MASK) != target_oa) continue;
-        if (!IsValidDescriptor(e)) continue;
-        pte_locs.push_back(gpa);
-        LOG("    PTE candidate @ GPA=%016llX  entry=%016llX",
-            (unsigned long long)gpa, (unsigned long long)e);
-        if (pte_locs.size() >= 32) break;
-    }
-
-    if (pte_locs.empty()) { LOG("  no PTE candidates found"); return result; }
-
-    for (RTGCPHYS pte_loc : pte_locs) {
-        RTGCPHYS pte_page_gpa = pte_loc & ~(RTGCPHYS)0xFFF;
-        uint64_t pte_idx      = (pte_loc & 0xFFF) / 8;
-
-        std::vector<RTGCPHYS> pmd_locs;
-        for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-            uint64_t e = 0;
-            if (!GuestRead64(gpa, &e)) continue;
-            if ((e & ARM64_OA_MASK) != pte_page_gpa) continue;
-            if (!IsValidDescriptor(e)) continue;
-            pmd_locs.push_back(gpa);
-            if (pmd_locs.size() >= 8) break;
-        }
-
-        for (RTGCPHYS pmd_loc : pmd_locs) {
-            RTGCPHYS pmd_page_gpa = pmd_loc & ~(RTGCPHYS)0xFFF;
-            uint64_t pmd_idx      = (pmd_loc & 0xFFF) / 8;
-
-            for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-                uint64_t e = 0;
-                if (!GuestRead64(gpa, &e)) continue;
-                if ((e & ARM64_OA_MASK) != pmd_page_gpa) continue;
-                if (!IsValidDescriptor(e)) continue;
-
-                RTGCPHYS pgd_page_gpa = gpa & ~(RTGCPHYS)0xFFF;
-                uint64_t pgd_idx      = (gpa & 0xFFF) / 8;
-                uint64_t load_bias    = (pgd_idx << 30) | (pmd_idx << 21) | (pte_idx << 12);
-
-                if (load_bias >= 0x8000000000ULL) continue;
-
-                RTGCPHYS verify_gpa = 0;
-                if (GvaToGpa(pgd_page_gpa, load_bias, &verify_gpa) &&
-                    verify_gpa == elf_header_gpa)
-                {
-                    LOG("  VERIFIED: TTBR0=%016llX load_bias=%016llX",
-                        (unsigned long long)pgd_page_gpa,
-                        (unsigned long long)load_bias);
-                    result.ttbr0         = pgd_page_gpa;
-                    result.load_bias_gva = load_bias;
-                    result.valid         = true;
-                    return result;
-                }
-            }
-        }
-    }
-
-    LOG("  TTBR0 not found");
-    return result;
-}
-
-
-// ── FindSonamePageGPA ─────────────────────────────────────────────────────────────────────────────────
-// ".dynstr" is in .rodata and always resident while the game runs.
-// Scan for the null-terminated SONAME "libil2cpp.so" and return its
-// page-aligned GPA, or (RTGCPHYS)-1 on failure.
-
-static RTGCPHYS FindSonamePageGPA()
-{
-    static const char SONAME[] = "libil2cpp.so";
-    static const size_t SL     = sizeof(SONAME);
-    LOG("=== stage 3b-pre: scanning for SONAME \"libil2cpp.so\" ===");
-    uint8_t pg[4096];
-    for (RTGCPHYS gpa = 0x4000000ULL; gpa < GUEST_RAM_BYTES; gpa += 0x1000) {
-        if ((gpa & 0x0FFFFFFF) == 0)
-            LOG("  SONAME scan: GPA=%016llX", (unsigned long long)gpa);
-        if (!GuestRead(gpa, pg, sizeof(pg))) continue;
-        for (size_t off = 0; off + SL <= sizeof(pg); off++) {
-            if (pg[off] != 'l') continue;
-            if (memcmp(pg + off, SONAME, SL) != 0) continue;
-            if (off > 0 && pg[off - 1] != '\0') continue;
-            LOG("  found at GPA=%016llX+0x%03zx", (unsigned long long)gpa, off);
-            return gpa;
-        }
-    }
-    LOG("  SONAME string not found in guest RAM");
-    return (RTGCPHYS)-1ULL;
-}
-
-
-// ── FindAllTTBR0Candidates ─────────────────────────────────────────────────────────────────────────
-//
-// Collects all (pgd, gva_res) pairs that map the SONAME page WITHOUT any
-// backward walk or load_bias computation.  Deduplicates by pgd value.
-// Does NOT require LibInfo -- works even when stage 3a failed.
-// The correct TTBR0 (game process) is identified in FindLaneFieldsMulti.
-
-static std::vector<PageTableInfo>
-FindAllTTBR0Candidates(RTGCPHYS resident_gpa)
-{
-    std::vector<PageTableInfo> results;
-    static const size_t MAX_CANDIDATES = 64;
-
-    if (resident_gpa == (RTGCPHYS)-1ULL) {
-        LOG("FindAllTTBR0Candidates: no resident page");
-        return results;
-    }
-
-    uint64_t target_oa     = resident_gpa & ARM64_OA_MASK;
-    uint64_t target_oa_2mb = resident_gpa & 0x0000FFFFFFE00000ULL;
-    uint64_t page_in_block = target_oa & 0x0000000001FF000ULL;
-
-    LOG("=== stage 3b-candidates: leaf scan for GPA=%016llX ===",
-        (unsigned long long)resident_gpa);
-
-    // ---- pass 1: 4KB PTEs and 2MB PMD blocks --------------------------------
-    struct LeafEntry { RTGCPHYS loc; bool is_block; };
-    std::vector<LeafEntry> leaves;
-    leaves.reserve(32);
-    for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-        if ((gpa & 0x0FFFFFFF) == 0)
-            LOG("  leaf scan: GPA=%016llX", (unsigned long long)gpa);
-        uint64_t e = 0;
-        if (!GuestRead64(gpa, &e)) continue;
-        uint8_t type = (uint8_t)(e & 0x3);
-        if (type == 0x3) {
-            if (!IsValidDescriptor(e)) continue;
-            if ((e & ARM64_OA_MASK) == target_oa) leaves.push_back({gpa, false});
-        } else if (type == 0x1) {
-            uint64_t oa2 = e & 0x0000FFFFFFE00000ULL;
-            if (oa2 == target_oa_2mb && oa2 > 0 && oa2 < GUEST_RAM_BYTES)
-                leaves.push_back({gpa, true});
-        }
-        if (leaves.size() >= 32) break;
-    }
-    if (leaves.empty()) { LOG("  no leaf entries found"); return results; }
-    LOG("  %zu leaf entries found", leaves.size());
-
-    // ---- passes 2 & 3: walk leaf -> PGD, deduplicate by pgd value -----------
-    for (const auto& leaf : leaves) {
-        if (results.size() >= MAX_CANDIDATES) break;
-        RTGCPHYS lp = leaf.loc & ~(RTGCPHYS)0xFFF;
-        uint64_t li = (leaf.loc & 0xFFF) / 8;
-
-        if (!leaf.is_block) {
-            // 4KB path: PTE page -> PMD -> PGD
-            std::vector<RTGCPHYS> pmds;
-            for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-                uint64_t e = 0;
-                if (!GuestRead64(gpa, &e)) continue;
-                if (!IsValidDescriptor(e)) continue;
-                if ((e & ARM64_OA_MASK) != lp) continue;
-                pmds.push_back(gpa);
-                if (pmds.size() >= 8) break;
-            }
-            for (RTGCPHYS pm : pmds) {
-                if (results.size() >= MAX_CANDIDATES) break;
-                RTGCPHYS pp = pm & ~(RTGCPHYS)0xFFF;
-                uint64_t pi = (pm & 0xFFF) / 8;
-                for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-                    if (results.size() >= MAX_CANDIDATES) break;
-                    uint64_t e = 0;
-                    if (!GuestRead64(gpa, &e)) continue;
-                    if (!IsValidDescriptor(e)) continue;
-                    if ((e & ARM64_OA_MASK) != pp) continue;
-                    RTGCPHYS pgd = gpa & ~(RTGCPHYS)0xFFF;
-                    uint64_t gi  = (gpa & 0xFFF) / 8;
-                    uint64_t gva = (gi << 30) | (pi << 21) | (li << 12);
-                    if (gva >= 0x8000000000ULL) continue;
-                    RTGCPHYS chk = 0;
-                    if (!GvaToGpa(pgd, gva, &chk) || chk != target_oa) continue;
-                    bool dup = false;
-                    for (const auto& r : results) if (r.ttbr0==pgd){dup=true;break;}
-                    if (dup) continue;
-                    LOG("  4KB cand: pgd=%016llX gva=%016llX",
-                        (unsigned long long)pgd, (unsigned long long)gva);
-                    results.push_back({pgd, 0, true});
-                }
-            }
-        } else {
-            // 2MB path: PMD block IS leaf -> PGD (one level up)
-            for (RTGCPHYS gpa = 0; gpa < GUEST_RAM_BYTES; gpa += 8) {
-                if (results.size() >= MAX_CANDIDATES) break;
-                uint64_t e = 0;
-                if (!GuestRead64(gpa, &e)) continue;
-                if (!IsValidDescriptor(e)) continue;
-                if ((e & ARM64_OA_MASK) != lp) continue;
-                RTGCPHYS pgd = gpa & ~(RTGCPHYS)0xFFF;
-                uint64_t gi  = (gpa & 0xFFF) / 8;
-                uint64_t gva = (gi << 30) | (li << 21) | page_in_block;
-                if (gva >= 0x8000000000ULL) continue;
-                RTGCPHYS chk = 0;
-                if (!GvaToGpa(pgd, gva, &chk) || chk != target_oa) continue;
+    if (g_metas.empty()) {
+        for (uint64_t mg : g_magicGpas) {
+            std::vector<LeafRef> leaves = { { mg & ~0xFFFULL, mg & 0xFFF } };
+            auto chains = ChainsForLeaves(leaves, 32768);
+            LOG("stage 4: magic %016llX -> %zu mappings", (unsigned long long)mg,
+                chains.size());
+            for (const auto& c : chains) {
+                uint64_t m = c.gva;            // magic sits at metadata base
+                uint64_t mgpa = 0;
+                uint32_t magic = 0;
+                if (!X64Translate(c.cr3, m, &mgpa, nullptr)) continue;
+                if (!GuestRead32(mgpa, &magic) || magic != 0xFAB11BAF) continue;
+                // Do not require the class-name strings here: the metadata
+                // file pages can be paged out (probe 32) even while the magic
+                // page is resident.  Keep only the geometric checks; class
+                // discovery below re-validates the base by finding
+                // CharacterMotor name pointers at base+OFF_CM_NAME.
+                if (m & 0xFFF) continue;
+                if (m >= 0x800000000000ULL) continue;
                 bool dup = false;
-                for (const auto& r : results) if (r.ttbr0==pgd){dup=true;break;}
+                for (const auto& e : g_metas)
+                    if (e.cr3 == c.cr3 && e.base == m) { dup = true; break; }
                 if (dup) continue;
-                LOG("  2MB cand: pgd=%016llX gva=%016llX",
-                    (unsigned long long)pgd, (unsigned long long)gva);
-                results.push_back({pgd, 0, true});
+                LOG("stage 4: metadata base %016llX in CR3 %016llX",
+                    (unsigned long long)m, (unsigned long long)c.cr3);
+                g_metas.push_back({ c.cr3, m });
             }
         }
+        if (g_metas.empty()) { LOG("stage 4: no metadata base found"); return false; }
     }
-    LOG("  %zu unique TTBR0 candidates collected", results.size());
-    return results;
-}
 
+    // Try each (cr3, base) until the CharacterMotor class exists.
+    for (const auto& mc : g_metas) {
+        uint64_t namePtr = mc.base + OFF_CM_NAME;
+        auto locs = FindQwordsAny({ namePtr }, 4096);
+        LOG("stage 4: CR3=%016llX base=%016llX class-name qwords=%zu",
+            (unsigned long long)mc.cr3, (unsigned long long)mc.base, locs.size());
+        if (locs.empty()) continue;
 
-struct Il2CppExports {
-    uint64_t domain_get, domain_get_assemblies, class_from_name;
-    uint64_t class_get_field_from_name, class_get_fields, class_num_fields;
-    uint64_t field_get_offset, field_get_name;
-    uint64_t assembly_get_image, image_get_class, image_get_class_count;
-    bool ok;
-};
-
-static Il2CppExports ReadIl2CppExports(const LibInfo& lib, const PageTableInfo& pt)
-{
-    Il2CppExports exp = {};
-    uint64_t dyn_gva = pt.load_bias_gva + (lib.dyn_vaddr - lib.load0_vaddr);
-    LOG("PT_DYNAMIC GVA = %016llX", (unsigned long long)dyn_gva);
-
-    uint64_t dt_strtab = 0, dt_symtab = 0, dt_strsz = 0, dt_syment = 0, dt_hash = 0;
-    uint64_t n_dyn = lib.dyn_filesz / sizeof(Elf64Dyn);
-    if (n_dyn > 512) n_dyn = 512;
-
-    for (uint64_t di = 0; di < n_dyn; di++) {
-        Elf64Dyn d;
-        if (!GvaRead(pt.ttbr0, dyn_gva + di * sizeof(Elf64Dyn), &d, sizeof(d))) break;
-        if (d.d_tag == DT_NULL) break;
-        switch (d.d_tag) {
-            case DT_STRTAB:  dt_strtab  = d.d_val; break;
-            case DT_SYMTAB:  dt_symtab  = d.d_val; break;
-            case DT_STRSZ:   dt_strsz   = d.d_val; break;
-            case DT_SYMENT:  dt_syment  = d.d_val; break;
-            case DT_HASH:    dt_hash    = d.d_val; break;
+        ClassInfo cm;
+        for (uint64_t loc : locs) {
+            if (ValidateClassAt(mc.cr3, loc, namePtr, 40,
+                                "MinimalVerticalSpeed", &cm)) break;
         }
+        if (!cm.ok) continue;
+
+        // Resolve LaneStateInfo through CharacterMotor.field[27]'s Il2CppType.
+        // Scanning for the metadata name pointer finds a *different* class
+        // with the same name (probe 28/29: type data.klass MISMATCH) whose
+        // field offsets do not match the inline struct.
+        ClassInfo lsi;
+        {
+            int fi = FindFieldIndexByName(mc.cr3, cm, "_laneStateInfo");
+            uint64_t typeGva = 0;
+            if (fi >= 0)
+                GuestRead64(cm.fields_gpa + (uint64_t)fi * 0x20 + 0x08, &typeGva);
+            uint64_t typeGpa = 0, klassGva = 0, klassGpa = 0;
+            if (typeGva && X64Translate(mc.cr3, typeGva, &typeGpa, nullptr)) {
+                GuestRead64(typeGpa, &klassGva);
+                if (klassGva && X64Translate(mc.cr3, klassGva, &klassGpa, nullptr)) {
+                    ClassInfo ci;
+                    if (LoadClassAt(mc.cr3, klassGpa, &ci)) {
+                        lsi = ci;
+                        LOG("stage 4: LaneStateInfo via field type GPA=%016llX fc=%u",
+                            (unsigned long long)lsi.gpa, lsi.fc);
+                    } else {
+                        LOG("stage 4: field type klass GPA=%016llX not loadable;"
+                            " using verified inline offsets",
+                            (unsigned long long)klassGpa);
+                    }
+                }
+            }
+            if (!lsi.ok)
+                LOG("stage 4: LaneStateInfo type unresolved; using verified"
+                    " offsets targetLane=+0x%X changing=+0x%X",
+                    FB_TARGET_LANE, FB_CHANGING);
+        }
+
+        g_cr3 = mc.cr3;
+        g_metaBase = mc.base;
+        g_cm = cm;
+        g_lsi = lsi;
+        LOG("stage 4: CharacterMotor class GPA=%016llX fc=%u fields=%016llX",
+            (unsigned long long)g_cm.gpa, g_cm.fc,
+            (unsigned long long)g_cm.fields_gpa);
+        if (g_lsi.ok)
+            LOG("stage 4: LaneStateInfo class GPA=%016llX fc=%u",
+                (unsigned long long)g_lsi.gpa, g_lsi.fc);
+
+        offLaneState    = FindFieldOffsetByName(g_cr3, g_cm, "_laneStateInfo", FB_LANE_STATE);
+        offController   = FindFieldOffsetByName(g_cr3, g_cm, "_controller", FB_CONTROLLER);
+        offCurrentState = FindFieldOffsetByName(g_cr3, g_cm, "_currentState", FB_CURRENT_ST);
+        offAllowInput   = FindFieldOffsetByName(g_cr3, g_cm, "<AllowInput>k__BackingField", FB_ALLOW_INPUT);
+        offVelocity     = FindFieldOffsetByName(g_cr3, g_cm, "Velocity", FB_VELOCITY);
+        offIsActive     = FindFieldOffsetByName(g_cr3, g_cm, "<IsActive>k__BackingField", FB_IS_ACTIVE);
+        offAccelerate   = FindFieldOffsetByName(g_cr3, g_cm, "_canAccelerate", FB_ACCELERATE);
+        if (g_lsi.ok) {
+            offTargetLane = FindFieldOffsetByName(g_cr3, g_lsi, "TargetLane", FB_TARGET_LANE);
+            offChanging   = FindFieldOffsetByName(g_cr3, g_lsi, "IsChangingLane", FB_CHANGING);
+        }
+        LOG("stage 4: offsets laneState=+0x%X controller=+0x%X currentState=+0x%X",
+            offLaneState, offController, offCurrentState);
+        LOG("stage 4: allow=+0x%X active=+0x%X accel=+0x%X velocity=+0x%X"
+            " targetLane=+0x%X changing=+0x%X",
+            offAllowInput, offIsActive, offAccelerate, offVelocity,
+            offTargetLane, offChanging);
+
+        std::set<uint64_t> classPages = { g_cm.gpa & ~0xFFFULL };
+        auto cmMapped = WalkCr3ForPages(g_cr3, classPages);
+        g_cmClassPtrs.clear();
+        auto it = cmMapped.find(g_cm.gpa & ~0xFFFULL);
+        if (it != cmMapped.end())
+            for (uint64_t g : it->second)
+                g_cmClassPtrs.insert(g + (g_cm.gpa & 0xFFF));
+        LOG("stage 4: class pointer GVAs=%zu", g_cmClassPtrs.size());
+        for (uint64_t g : g_cmClassPtrs)
+            LOG("  class ptr %016llX", (unsigned long long)g);
+        return !g_cmClassPtrs.empty();
     }
-
-    if (!dt_strtab || !dt_symtab) {
-        LOG("missing DT_STRTAB or DT_SYMTAB");
-        return exp;
-    }
-
-    uint64_t nsyms = 0;
-    if (dt_hash) {
-        uint32_t nchain = 0;
-        if (GvaRead32(pt.ttbr0, dt_hash + 4, &nchain) && nchain < 500000)
-            nsyms = nchain;
-    }
-    if (!nsyms) nsyms = 200000;
-
-    uint32_t sym_size = (dt_syment > 0 && dt_syment <= 64)
-                        ? (uint32_t)dt_syment : (uint32_t)sizeof(Elf64Sym);
-
-    for (uint64_t si = 0; si < nsyms; si++) {
-        Elf64Sym sym;
-        if (!GvaRead(pt.ttbr0, dt_symtab + si * sym_size, &sym, sizeof(sym))) break;
-        if (dt_strsz && sym.st_name >= dt_strsz) break;
-        if (sym.st_value == 0) continue;
-        std::string name = GvaReadStr(pt.ttbr0, dt_strtab + sym.st_name, 64);
-        if      (name == "il2cpp_domain_get")                exp.domain_get              = sym.st_value;
-        else if (name == "il2cpp_domain_get_assemblies")     exp.domain_get_assemblies   = sym.st_value;
-        else if (name == "il2cpp_class_from_name")           exp.class_from_name         = sym.st_value;
-        else if (name == "il2cpp_class_get_field_from_name") exp.class_get_field_from_name=sym.st_value;
-        else if (name == "il2cpp_class_get_fields")          exp.class_get_fields        = sym.st_value;
-        else if (name == "il2cpp_class_num_fields")          exp.class_num_fields        = sym.st_value;
-        else if (name == "il2cpp_field_get_offset")          exp.field_get_offset        = sym.st_value;
-        else if (name == "il2cpp_field_get_name")            exp.field_get_name          = sym.st_value;
-        else if (name == "il2cpp_assembly_get_image")        exp.assembly_get_image      = sym.st_value;
-        else if (name == "il2cpp_image_get_class")           exp.image_get_class         = sym.st_value;
-        else if (name == "il2cpp_image_get_class_count")     exp.image_get_class_count   = sym.st_value;
-    }
-
-    exp.ok = exp.domain_get && exp.field_get_offset && exp.field_get_name;
-    LOG("exports %s", exp.ok ? "OK" : "incomplete");
-    return exp;
-}
-
-struct ClassCandidate { RTGCPHYS gpa; uint64_t fields_gva; };
-
-struct FieldResult {
-    uint32_t currentLane_offset, laneIndex_offset;
-    RTGCPHYS class_gpa;
-    RTGCPHYS ttbr0;    // winning TTBR0, or 0 if not via page table
-    bool ok;
-};
-
-static const uint32_t CLASS_OFF_NAME      = 0x10;
-static const uint32_t CLASS_OFF_NAMESPACE = 0x18;
-static const uint32_t CLASS_OFF_FIELDS    = 0x80;
-static const uint32_t FIELD_SIZE          = 0x18;
-static const uint32_t FIELD_OFF_NAME      = 0x00;
-static const uint32_t FIELD_OFF_OFFSET    = 0x10;
-
-static bool TryReadFieldOffset(RTGCPHYS fields_gpa, uint32_t field_idx,
-                                const char* expected_name, uint32_t* out_offset,
-                                RTGCPHYS ttbr0 = 0)
-{
-    RTGCPHYS fgpa = fields_gpa + (uint64_t)field_idx * FIELD_SIZE;
-    uint64_t name_gva = 0;
-    if (!GuestRead64(fgpa + FIELD_OFF_NAME, &name_gva)) return false;
-    if (!name_gva) return false;
-    std::string fname;
-    if (ttbr0 != 0 && name_gva >= GUEST_RAM_BYTES)
-        fname = GvaReadStr(ttbr0, name_gva, 64);
-    else if (name_gva < GUEST_RAM_BYTES)
-        fname = GuestReadStr((RTGCPHYS)name_gva, 64);
-    else
-        return false;
-    if (fname != expected_name) return false;
-    uint32_t byte_off = 0;
-    if (!GuestRead32(fgpa + FIELD_OFF_OFFSET, &byte_off)) return false;
-    if (byte_off == 0xFFFFFFFF || byte_off > 0x10000) return false;
-    *out_offset = byte_off;
-    return true;
-}
-
-static bool ReadClassFieldCount(RTGCPHYS class_gpa, uint32_t* out_count)
-{
-    static const uint32_t offsets[] = { 0xBC, 0xB8, 0xC0, 0xC4, 0x88, 0x90 };
-    for (auto off : offsets) {
-        uint32_t v = 0;
-        if (!GuestRead32(class_gpa + off, &v)) continue;
-        uint16_t fc = (uint16_t)(v & 0xFFFF);
-        if (fc == 99) { *out_count = fc; return true; }
-    }
+    LOG("stage 4: CharacterMotor class not initialized yet");
     return false;
 }
 
-// ScanClassCandidates: single page-granularity scan of guest RAM.
-// Collects (gpa, fields_gva) pairs where any known field-count offset holds 99.
-// Called once; results reused by FindLaneFieldsMulti across all TTBR0 candidates.
-static std::vector<ClassCandidate> ScanClassCandidates()
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGE 5 — player CharacterMotor
+// ─────────────────────────────────────────────────────────────────────────────
+struct Motor {
+    uint64_t gpa = 0;
+    int32_t target = 0;
+    uint8_t chg = 0, allow = 0, active = 0, accel = 0;
+    float vx = 0, vy = 0, vz = 0;
+    uint64_t ctrl = 0, state = 0;
+    std::string ctrlClass;
+};
+
+static void ReadMotor(uint64_t ip, Motor* m)
 {
-    std::vector<ClassCandidate> results;
-    static const uint32_t fc_offs[] = { 0xBC, 0xB8, 0xC0, 0xC4, 0x88, 0x90 };
-    static const uint32_t MAX_OFF = 0x1000 - 0x100;
-    uint8_t page[4096];
-    LOG("=== STAGE 5a: class candidate scan ===");
-    for (RTGCPHYS pgpa = 0x40000000ULL; pgpa < GUEST_RAM_BYTES; pgpa += 0x1000) {
-        if ((pgpa & 0x0FFFFFFF) == 0)
-            LOG("  candidate scan: GPA=%016llX", (unsigned long long)pgpa);
-        if (!GuestRead(pgpa, page, sizeof(page))) continue;
-        for (uint32_t off = 0; off < MAX_OFF; off += 8) {
-            bool fc_ok = false;
-            for (uint32_t fco : fc_offs) {
-                uint32_t v; memcpy(&v, page + off + fco, 4);
-                if ((v & 0xFFFF) == 99) { fc_ok = true; break; }
+    m->gpa = ip;
+    GuestRead32(ip + offLaneState + offTargetLane, (uint32_t*)&m->target);
+    GuestRead(ip + offLaneState + offChanging, &m->chg, 1);
+    GuestRead(ip + offAllowInput, &m->allow, 1);
+    GuestRead(ip + offIsActive, &m->active, 1);
+    GuestRead(ip + offAccelerate, &m->accel, 1);
+    GuestRead32(ip + offVelocity, (uint32_t*)&m->vx);
+    GuestRead32(ip + offVelocity + 4, (uint32_t*)&m->vy);
+    GuestRead32(ip + offVelocity + 8, (uint32_t*)&m->vz);
+    GuestRead64(ip + offController, &m->ctrl);
+    GuestRead64(ip + offCurrentState, &m->state);
+}
+
+static bool MotorSane(const Motor& m)
+{
+    if (m.target < -2 || m.target > 2) return false;
+    if (m.chg > 1 || m.allow > 1 || m.active > 1 || m.accel > 1) return false;
+    if (!std::isfinite(m.vx) || !std::isfinite(m.vy) || !std::isfinite(m.vz)) return false;
+    if (fabsf(m.vx) > 200 || fabsf(m.vy) > 200 || fabsf(m.vz) > 200) return false;
+    return true;
+}
+
+static bool MotorStillValid(uint64_t gpa)
+{
+    if (!gpa) return false;
+    uint64_t klass = 0;
+    if (!GuestRead64(gpa, &klass)) return false;
+    return g_cmClassPtrs.count(klass) != 0;
+}
+
+static bool FindPlayerMotor()
+{
+    LOG("=== STAGE 5: player CharacterMotor ===");
+    if (!g_cm.ok || g_cmClassPtrs.empty()) return false;
+
+    for (int round = 0; round < 4; round++) {
+        if (round) { LOG("stage 5: retry %d in 3s", round); Sleep(3000); }
+
+        auto hits = FindQwordsAny(g_cmClassPtrs, 8192);
+        std::vector<Motor> sane;
+        size_t monitorZero = 0, laneOk = 0, flagsOk = 0;
+        for (uint64_t ip : hits) {
+            uint64_t monitor = 1;
+            GuestRead64(ip + 8, &monitor);
+            if (monitor != 0) continue;
+            monitorZero++;
+            Motor m;
+            ReadMotor(ip, &m);
+            if (m.target < -2 || m.target > 2) continue;
+            laneOk++;
+            if (m.chg > 1 || m.allow > 1 || m.active > 1 || m.accel > 1) continue;
+            flagsOk++;
+            if (!MotorSane(m)) continue;
+            sane.push_back(m);
+        }
+        LOG("stage 5: round %d hits=%zu monitor0=%zu laneOk=%zu flagsOk=%zu sane=%zu",
+            round + 1, hits.size(), monitorZero, laneOk, flagsOk, sane.size());
+
+        const Motor* pick = nullptr;
+        for (const auto& m : sane)
+            if (m.allow && m.active && fabsf(m.vz) >= 0.5f)
+                if (!pick || fabsf(m.vz) > fabsf(pick->vz)) pick = &m;
+        if (!pick)
+            for (const auto& m : sane)
+                if (m.allow && m.active) { pick = &m; break; }
+        if (!pick && sane.size() == 1) pick = &sane[0];
+
+        if (!pick) {
+            for (auto& m : sane) {
+                m.ctrlClass = ClassNameAt(g_cr3, m.ctrl);
+                LOG("stage 5: candidate %016llX target=%d chg=%u allow=%u active=%u"
+                    " accel=%u vel=(%.2f,%.2f,%.2f) ctrl=%s",
+                    (unsigned long long)m.gpa, m.target, m.chg, m.allow, m.active,
+                    m.accel, m.vx, m.vy, m.vz, m.ctrlClass.c_str());
             }
-            if (!fc_ok) continue;
-            uint64_t fields_gva = 0;
-            GuestRead64(pgpa + off + CLASS_OFF_FIELDS, &fields_gva);
-            if (!fields_gva) continue;
-            results.push_back({pgpa + off, fields_gva});
-            if (results.size() >= 500) goto scan_done;
+            continue;
         }
+
+        uint64_t laneGpa = pick->gpa + offLaneState + offTargetLane;
+        g_motorGpa.store(pick->gpa);
+        g_autoLaneGpa.store(laneGpa);
+        std::string cc = ClassNameAt(g_cr3, pick->ctrl);
+        LOG("stage 5: PLAYER motor=%016llX target=%d allow=%u active=%u accel=%u"
+            " vel=(%.2f,%.2f,%.2f) ctrl=%s",
+            (unsigned long long)pick->gpa, pick->target, pick->allow, pick->active,
+            pick->accel, pick->vx, pick->vy, pick->vz, cc.c_str());
+        LOG("stage 5: LANE_GPA=%016llX", (unsigned long long)laneGpa);
+        return true;
     }
-scan_done:
-    LOG("  %zu class candidates with field_count=99", results.size());
-    return results;
+    LOG("stage 5: no active player motor found (paused / loading?)");
+    return false;
 }
 
-// FindLaneFieldsMulti: tries every TTBR0 against pre-scanned class candidates.
-// Only the game process TTBR0 correctly translates the GVA fields pointer to a
-// GPA whose field names read back as "currentLane" and "laneIndex".
-static FieldResult FindLaneFieldsMulti(
-    const std::vector<ClassCandidate>& class_cands,
-    const std::vector<PageTableInfo>&  ttbr0_list)
+// ─────────────────────────────────────────────────────────────────────────────
+// Lane read + cache validation
+// ─────────────────────────────────────────────────────────────────────────────
+static bool LaneRead(int32_t* out)
 {
-    LOG("=== STAGE 5b: TTBR0 x class matching (%zu ttbrs, %zu candidates) ===",
-        ttbr0_list.size(), class_cands.size());
-    for (const auto& pt : ttbr0_list) {
-        for (const auto& cand : class_cands) {
-            RTGCPHYS fields_ptr = 0;
-            if (pt.ttbr0 != 0 && cand.fields_gva >= GUEST_RAM_BYTES) {
-                if (!GvaToGpa(pt.ttbr0, cand.fields_gva, &fields_ptr)) continue;
-            } else if (cand.fields_gva < GUEST_RAM_BYTES && !(cand.fields_gva & 7)) {
-                fields_ptr = (RTGCPHYS)cand.fields_gva;
-            } else { continue; }
-            uint32_t off40 = 0, off83 = 0;
-            if (!TryReadFieldOffset(fields_ptr, 40, "currentLane", &off40, pt.ttbr0)) continue;
-            if (!TryReadFieldOffset(fields_ptr, 83, "laneIndex",   &off83, pt.ttbr0)) continue;
-            uint64_t name_gva = 0; GuestRead64(cand.gpa + CLASS_OFF_NAME, &name_gva);
-            std::string cls_name;
-            if (pt.ttbr0 != 0 && name_gva >= GUEST_RAM_BYTES)
-                cls_name = GvaReadStr(pt.ttbr0, name_gva, 128);
-            else if (name_gva && name_gva < GUEST_RAM_BYTES)
-                cls_name = GuestReadStr((RTGCPHYS)name_gva, 128);
-            else
-                cls_name = "<unknown>";
-            LOG("FOUND [ttbr0=%016llX] class \"%s\" @ GPA=%016llX "
-                "currentLane=+%u  laneIndex=+%u",
-                (unsigned long long)pt.ttbr0, cls_name.c_str(),
-                (unsigned long long)cand.gpa, off40, off83);
-            FieldResult res;
-            res.ok = true;
-            res.currentLane_offset = off40;
-            res.laneIndex_offset   = off83;
-            res.class_gpa          = cand.gpa;
-            res.ttbr0              = pt.ttbr0;
-            return res;
-        }
-    }
-    LOG("  no TTBR0 matched any class candidate");
-    return {};
+    if (!out) return false;
+    uint64_t gpa = g_useUserGpa.load() ? g_userGpa.load() : g_autoLaneGpa.load();
+    if (!gpa) return false;
+    int32_t v = 0;
+    if (!GuestRead(gpa, &v, 4)) return false;
+    if (v < -1 || v > 1) return false;
+    *out = v;
+    return true;
 }
 
-// FindLaneFields: single-TTBR0 fallback (kept for direct use if needed)
-static FieldResult FindLaneFields(RTGCPHYS ttbr0 = 0)
+static void ValidateCachedMotor()
 {
-    FieldResult res = {};
-    LOG("brute-force class scan for field_count=99 (ttbr0=%016llX) ...",
-        (unsigned long long)ttbr0);
-    static const uint32_t fc_offs[] = { 0xBC, 0xB8, 0xC0, 0xC4, 0x88, 0x90 };
-    static const uint32_t MAX_OFF = 0x1000 - 0x100;
-    uint8_t page[4096];
-    for (RTGCPHYS pgpa = 0x40000000ULL; pgpa < GUEST_RAM_BYTES; pgpa += 0x1000) {
-        if ((pgpa & 0x0FFFFFFF) == 0)
-            LOG("  class scan: GPA=%016llX", (unsigned long long)pgpa);
-        if (!GuestRead(pgpa, page, sizeof(page))) continue;
-        for (uint32_t off = 0; off < MAX_OFF; off += 8) {
-            bool fc_ok = false;
-            for (uint32_t fco : fc_offs) {
-                uint32_t v; memcpy(&v, page + off + fco, 4);
-                if ((v & 0xFFFF) == 99) { fc_ok = true; break; }
-            }
-            if (!fc_ok) continue;
-            RTGCPHYS gpa = pgpa + off;
-            uint64_t fields_gva = 0;
-            if (!GuestRead64(gpa + CLASS_OFF_FIELDS, &fields_gva)) continue;
-            if (!fields_gva) continue;
-            RTGCPHYS fields_ptr = 0;
-            if (ttbr0 != 0 && fields_gva >= GUEST_RAM_BYTES) {
-                if (!GvaToGpa(ttbr0, fields_gva, &fields_ptr)) continue;
-            } else if (fields_gva < GUEST_RAM_BYTES && !(fields_gva & 7)) {
-                fields_ptr = (RTGCPHYS)fields_gva;
-            } else { continue; }
-            uint32_t off40 = 0, off83 = 0;
-            if (!TryReadFieldOffset(fields_ptr, 40, "currentLane", &off40, ttbr0)) continue;
-            if (!TryReadFieldOffset(fields_ptr, 83, "laneIndex",   &off83, ttbr0)) continue;
-            uint64_t name_gva = 0; GuestRead64(gpa + CLASS_OFF_NAME, &name_gva);
-            std::string cls_name;
-            if (ttbr0 != 0 && name_gva >= GUEST_RAM_BYTES)
-                cls_name = GvaReadStr(ttbr0, name_gva, 128);
-            else if (name_gva && name_gva < GUEST_RAM_BYTES)
-                cls_name = GuestReadStr((RTGCPHYS)name_gva, 128);
-            else cls_name = "<unknown>";
-            LOG("FOUND class \"%s\" @ GPA=%016llX  currentLane=+%u  laneIndex=+%u",
-                cls_name.c_str(), (unsigned long long)gpa, off40, off83);
-            res.ok = true; res.currentLane_offset = off40;
-            res.laneIndex_offset = off83; res.class_gpa = gpa; res.ttbr0 = ttbr0;
-            return res;
-        }
+    if (g_useUserGpa.load()) return;
+    uint64_t motor = g_motorGpa.load();
+    if (!motor) return;
+    if (!MotorStillValid(motor)) {
+        LOG("lane: cached motor %016llX invalid, re-discovering",
+            (unsigned long long)motor);
+        g_motorGpa.store(0);
+        g_autoLaneGpa.store(0);
     }
-    LOG("class not found");
-    return res;
 }
 
-static RTGCPHYS FindLaneGPA(const FieldResult& fields, RTGCPHYS ttbr0 = 0)
-{
-    LOG("scanning for live instances (ttbr0=%016llX) ...", (unsigned long long)ttbr0);
-    for (RTGCPHYS gpa = 0x40000000ULL; gpa < GUEST_RAM_BYTES; gpa += 8) {
-        if ((gpa & 0x0FFFFFFF) == 0)
-            LOG("  instance scan: GPA=%016llX", (unsigned long long)gpa);
-        uint64_t klass_gva = 0;
-        if (!GuestRead64(gpa, &klass_gva)) continue;
-        if (!klass_gva) continue;
-        if (ttbr0 != 0) {
-            RTGCPHYS klass_gpa = 0;
-            if (!GvaToGpa(ttbr0, klass_gva, &klass_gpa)) continue;
-            if (klass_gpa != fields.class_gpa) continue;
-        } else {
-            if (klass_gva != (uint64_t)fields.class_gpa) continue;
-        }
-        RTGCPHYS lane_gpa = gpa + fields.currentLane_offset;
-        int32_t lane_val = 0;
-        if (!GuestRead(lane_gpa, &lane_val, 4)) continue;
-        if (lane_val < -1 || lane_val > 1) continue;
-        int32_t idx_val = 0;
-        if (!GuestRead(gpa + fields.laneIndex_offset, &idx_val, 4)) continue;
-        if (idx_val < -1 || idx_val > 1) continue;
-        LOG("instance @ GPA=%016llX  currentLane=%d", (unsigned long long)gpa, lane_val);
-        LOG("LANE_GPA = %016llX", (unsigned long long)lane_gpa);
-        return lane_gpa;
-    }
-    LOG("no live instances found — start a run then send SET_GPA via pipe");
-    return (RTGCPHYS)-1;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Pipe helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Write a full line to the pipe. Returns false if the pipe broke.
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipe
+// ─────────────────────────────────────────────────────────────────────────────
 static bool PipeSend(HANDLE pipe, const char* msg)
 {
     DWORD written = 0;
     return WriteFile(pipe, msg, (DWORD)strlen(msg), &written, nullptr) == TRUE;
 }
 
-// Read one newline-terminated line from the pipe into buf (null-terminated).
-// Returns false on disconnect or error.
 static bool PipeReadLine(HANDLE pipe, char* buf, DWORD bufsz)
 {
     DWORD i = 0;
@@ -1019,23 +818,51 @@ static bool PipeReadLine(HANDLE pipe, char* buf, DWORD bufsz)
     return true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Pipe client handler — one thread per connected client
-// ═══════════════════════════════════════════════════════════════════════════════
+static void EmitLane(HANDLE pipe, int32_t val, int32_t* prev)
+{
+    if (val == *prev) return;
+    char resp[32];
+    snprintf(resp, sizeof(resp), "LANE %d\n", val);
+    if (PipeSend(pipe, resp)) *prev = val;
+}
+
+static void HandleRead(HANDLE pipe)
+{
+    int32_t val = 0;
+    char resp[32];
+    if (g_useUserGpa.load() && g_userGpa.load() == 0)
+        snprintf(resp, sizeof(resp), "ERR no GPA set\n");
+    else if (LaneRead(&val))
+        snprintf(resp, sizeof(resp), "LANE %d\n", val);
+    else
+        snprintf(resp, sizeof(resp), "LANE ?\n");
+    PipeSend(pipe, resp);
+}
+
+static void HandleSetGpa(HANDLE pipe, const char* hex)
+{
+    uint64_t gpa = 0;
+    if (sscanf(hex, "%llx", &gpa) == 1 && gpa < g_x64Ceiling) {
+        g_userGpa.store(gpa);
+        g_useUserGpa.store(true);
+        LOG("pipe: SET_GPA %016llX (manual override)", (unsigned long long)gpa);
+        PipeSend(pipe, "OK\n");
+    } else {
+        PipeSend(pipe, "ERR bad GPA\n");
+    }
+}
 
 static DWORD WINAPI PipeClientThread(LPVOID arg)
 {
     HANDLE pipe = (HANDLE)arg;
     char buf[256];
 
-    // Send a banner so the client knows the bridge state immediately
     if (!g_bridgeReady.load()) {
         PipeSend(pipe, "STATUS BRIDGE_NOT_READY\n");
     } else {
         char banner[128];
         snprintf(banner, sizeof(banner),
-                 "STATUS READY HVA_BASE %016llX\n",
-                 (unsigned long long)g_hvaBase);
+                 "STATUS READY HVA_BASE %016llX\n", (unsigned long long)g_hvaBase);
         PipeSend(pipe, banner);
     }
 
@@ -1053,54 +880,35 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
         }
         else if (strncmp(buf, "SET_GPA ", 8) == 0) {
             uint64_t gpa = 0;
-            if (sscanf_s(buf + 8, "%llx", &gpa) == 1 && gpa < GUEST_RAM_BYTES) {
-                g_laneGpa.store(gpa);
-                LOG("pipe: SET_GPA %016llX", (unsigned long long)gpa);
+            if (sscanf(buf + 8, "%llx", &gpa) == 1 && gpa < g_x64Ceiling) {
+                g_userGpa.store(gpa);
+                g_useUserGpa.store(true);
+                LOG("pipe: SET_GPA %016llX (manual override)", (unsigned long long)gpa);
                 if (!PipeSend(pipe, "OK\n")) break;
             } else {
                 if (!PipeSend(pipe, "ERR bad GPA\n")) break;
             }
         }
         else if (strcmp(buf, "READ") == 0) {
-            RTGCPHYS gpa = (RTGCPHYS)g_laneGpa.load();
-            int32_t val = -99;
-            char resp[32];
-            if (gpa == 0) {
-                snprintf(resp, sizeof(resp), "ERR no GPA set\n");
-            } else if (GuestRead(gpa, &val, 4) && val >= -1 && val <= 1) {
-                snprintf(resp, sizeof(resp), "LANE %d\n", val);
-            } else {
-                snprintf(resp, sizeof(resp), "LANE ?\n");
-            }
-            if (!PipeSend(pipe, resp)) break;
+            HandleRead(pipe);
         }
         else if (strcmp(buf, "START") == 0) {
             g_streaming.store(true);
             if (!PipeSend(pipe, "OK\n")) break;
 
-            // Stream until STOP or disconnect
             int32_t prev = 999;
+            bool bad = false;
             while (g_streaming.load()) {
-                RTGCPHYS gpa = (RTGCPHYS)g_laneGpa.load();
-                int32_t val = -99;
-                char resp[32];
-
-                if (gpa != 0 && GuestRead(gpa, &val, 4) && val >= -1 && val <= 1) {
-                    if (val != prev) {
-                        snprintf(resp, sizeof(resp), "LANE %d\n", val);
-                        if (!PipeSend(pipe, resp)) goto client_done;
-                        prev = val;
-                    }
-                } else if (gpa != 0) {
-                    // Bad read — notify once
-                    if (prev != -99) {
-                        if (!PipeSend(pipe, "LANE ?\n")) goto client_done;
-                        prev = -99;
-                    }
+                int32_t val = 0;
+                if (LaneRead(&val)) {
+                    EmitLane(pipe, val, &prev);
+                    bad = false;
+                } else if (!bad) {
+                    if (!PipeSend(pipe, "LANE ?\n")) goto client_done;
+                    prev = -99;
+                    bad = true;
                 }
 
-                // Non-blocking command check while streaming.
-                // Handles STOP, SET_GPA, PING, READ — anything the client sends mid-stream.
                 DWORD avail = 0;
                 if (PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr) && avail > 0) {
                     char cmd[256] = {};
@@ -1112,35 +920,17 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
                         break;
                     }
                     else if (strncmp(cmd, "SET_GPA ", 8) == 0) {
-                        uint64_t newgpa = 0;
-                        if (sscanf_s(cmd + 8, "%llx", &newgpa) == 1 && newgpa < GUEST_RAM_BYTES) {
-                            g_laneGpa.store(newgpa);
-                            prev = 999; // force immediate emit on next tick
-                            LOG("pipe: SET_GPA %016llX (mid-stream)", (unsigned long long)newgpa);
-                            if (!PipeSend(pipe, "OK\n")) goto client_done;
-                        } else {
-                            if (!PipeSend(pipe, "ERR bad GPA\n")) goto client_done;
-                        }
+                        HandleSetGpa(pipe, cmd + 8);
+                        prev = 999;
+                        bad = false;
                     }
                     else if (strcmp(cmd, "PING") == 0) {
                         if (!PipeSend(pipe, "PONG\n")) goto client_done;
                     }
                     else if (strcmp(cmd, "READ") == 0) {
-                        RTGCPHYS rgpa = (RTGCPHYS)g_laneGpa.load();
-                        int32_t rval = -99;
-                        char rresp[32];
-                        if (rgpa == 0) {
-                            snprintf(rresp, sizeof(rresp), "ERR no GPA set\n");
-                        } else if (GuestRead(rgpa, &rval, 4) && rval >= -1 && rval <= 1) {
-                            snprintf(rresp, sizeof(rresp), "LANE %d\n", rval);
-                        } else {
-                            snprintf(rresp, sizeof(rresp), "LANE ?\n");
-                        }
-                        if (!PipeSend(pipe, rresp)) goto client_done;
+                        HandleRead(pipe);
                     }
-                    // unknown mid-stream command: silently ignore to keep stream alive
                 }
-
                 Sleep(16);
             }
         }
@@ -1149,7 +939,7 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
             if (!PipeSend(pipe, "OK\n")) break;
         }
         else {
-            char resp[128];
+            char resp[160];
             snprintf(resp, sizeof(resp), "ERR unknown command: %s\n", buf);
             if (!PipeSend(pipe, resp)) break;
         }
@@ -1162,159 +952,100 @@ client_done:
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Pipe server — accepts connections forever, spawns a thread per client
-// ═══════════════════════════════════════════════════════════════════════════════
-
 static DWORD WINAPI PipeServerThread(LPVOID)
 {
     LOG("pipe server started: " PIPE_NAME);
     while (true) {
         HANDLE pipe = CreateNamedPipeA(
-            PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_NAME, PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            4096, 4096,
-            0, nullptr);
-
+            PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) {
             LOG("CreateNamedPipe failed: %lu", GetLastError());
             Sleep(1000);
             continue;
         }
-
-        // Block until a client connects
         if (!ConnectNamedPipe(pipe, nullptr)) {
             DWORD err = GetLastError();
-            if (err != ERROR_PIPE_CONNECTED) {
-                CloseHandle(pipe);
-                continue;
-            }
+            if (err != ERROR_PIPE_CONNECTED) { CloseHandle(pipe); continue; }
         }
-
         LOG("pipe client connected");
         CreateThread(nullptr, 0, PipeClientThread, (LPVOID)pipe, 0, nullptr);
-        // Loop immediately to accept the next client
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Main recon thread — runs once, sets up bridge, then pipe server takes over
-// ═══════════════════════════════════════════════════════════════════════════════
-
-static DWORD WINAPI ReconThread(LPVOID)
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker loop
+// ─────────────────────────────────────────────────────────────────────────────
+static void ResetDiscovery()
 {
-    Sleep(500);
-    g_log = fopen(LOG_PATH, "w");
-    if (!g_log) { OutputDebugStringA("[recon v12] fopen failed\n"); return 0; }
-    LOG("v12  — persistent pipe server");
+    g_cr3s.clear();
+    g_metas.clear();
+    g_metaBase = 0;
+    g_metaCr3 = 0;
+    g_magicGpas.clear();
+    g_cr3 = 0;
+    g_cm = {};
+    g_lsi = {};
+    g_cmClassPtrs.clear();
+    g_motorGpa.store(0);
+    g_autoLaneGpa.store(0);
+}
 
-    // Start pipe server immediately — clients can connect even before bridge is ready
-    // and will receive STATUS BRIDGE_NOT_READY until it is.
-    CreateThread(nullptr, 0, PipeServerThread, nullptr, 0, nullptr);
-
-    LOG("=== STAGE 1: VBox bridge ===");
-    if (!InitVBoxBridge()) goto done;
-    if (!ScanForUVM())     goto done;
-
-    LOG("=== STAGE 2: guest RAM range map ===");
-    if (!InitRangeMap()) goto done;
-
+static DWORD WINAPI WorkerThread(LPVOID)
+{
+    if (!Stage1Bridge() || !Stage2Ranges()) {
+        LOG("worker: bridge/range map failed; pipe stays BRIDGE_NOT_READY");
+        return 0;
+    }
     g_bridgeReady.store(true);
-    LOG("bridge ready — HVA_BASE=%016llX", (unsigned long long)g_hvaBase);
+    LOG("bridge ready — pipe accepts clients");
 
-#if DIRECT_LANE_GPA != 0
-    {
-        RTGCPHYS bypass_gpa = (RTGCPHYS)DIRECT_LANE_GPA;
-        g_laneGpa.store(bypass_gpa);
-        int32_t v = -99;
-        if (GuestRead(bypass_gpa, &v, 4) && v >= -1 && v <= 1)
-            LOG("DIRECT_LANE_GPA bypass: GPA=%016llX  lane=%d", (unsigned long long)bypass_gpa, v);
-        else
-            LOG("DIRECT_LANE_GPA bypass: GPA=%016llX  WARNING: bad read (start a run first)",
-                (unsigned long long)bypass_gpa);
-        // Bot loop is gone — SubwayBot drives from here via pipe.
-        goto done;
-    }
-#endif
-
-    // Full self-discovery path
-    {
-        LibInfo lib = FindLibIl2CppBase();
-        // lib.valid may be false if the ELF header page was evicted.
-        // Stages 3b/5a/5b/6 do NOT need it -- continue regardless.
-
-        // ---- stage 3b: TTBR0 candidates ----------------------------------
-        // lib.valid may be false if the ELF header page was evicted before
-        // the scan reached it.  Stages 3b/5a/5b/6 do NOT need LibInfo, so
-        // we proceed regardless.  Stage 4 and the classic TTBR0 path are
-        // guarded by lib.valid.
-        if (!lib.valid)
-            LOG("ELF header not found -- stages 3b+ continue without it");
-
-        LOG("=== STAGE 3b: TTBR0 candidates ===");
-        std::vector<PageTableInfo> ttbr0_list;
-        if (lib.valid) {
-            PageTableInfo pt_classic = FindTTBR0(lib.elf_header_gpa);
-            if (pt_classic.valid) {
-                LOG("  classic path: TTBR0=%016llX load_bias=%016llX",
-                    (unsigned long long)pt_classic.ttbr0,
-                    (unsigned long long)pt_classic.load_bias_gva);
-                ttbr0_list.push_back(pt_classic);
+    int emptyRounds = 0;
+    bool stage3Tried = false;
+    while (true) {
+        if (!g_useUserGpa.load()) {
+            if (!stage3Tried) {
+                stage3Tried = true;
+                if (!Stage3Cr3s())
+                    LOG("worker: stage 3 found no CR3; stage 4 will still try");
             }
-        }
-        {
-            RTGCPHYS soname_gpa = FindSonamePageGPA();
-            auto soname_ttbrs   = FindAllTTBR0Candidates(soname_gpa);
-            for (auto& t : soname_ttbrs) ttbr0_list.push_back(t);
-        }
-        LOG("  total TTBR0 candidates: %zu", ttbr0_list.size());
-
-        // ---- stage 4: exports (only when lib + load_bias available) ------
-        if (lib.valid) {
-            for (const auto& pt : ttbr0_list) {
-                if (pt.load_bias_gva != 0) {
-                    LOG("=== STAGE 4: export RVAs ===");
-                    ReadIl2CppExports(lib, pt);
-                    break;
+            if (!g_cm.ok) {
+                if (!Stage4ClassesOnce()) { Sleep(5000); continue; }
+            }
+            if (g_motorGpa.load() == 0 || !MotorStillValid(g_motorGpa.load())) {
+                if (!FindPlayerMotor()) {
+                    if (g_motorGpa.load() == 0) emptyRounds++;
+                    if (emptyRounds >= 3) {
+                        LOG("worker: repeated empty scans, resetting discovery");
+                        ResetDiscovery();
+                        emptyRounds = 0;
+                    }
+                } else {
+                    emptyRounds = 0;
                 }
+            } else {
+                ValidateCachedMotor();
             }
         }
-
-        // ---- stages 5a/5b/6: fully independent of LibInfo ---------------
-        auto class_cands = ScanClassCandidates();
-
-        FieldResult fields = FindLaneFieldsMulti(class_cands, ttbr0_list);
-        if (!fields.ok) { LOG("field discovery failed"); goto done; }
-
-        LOG("=== STAGE 6: instance scan ===");
-        RTGCPHYS lane_gpa = FindLaneGPA(fields, fields.ttbr0);
-        if (lane_gpa != (RTGCPHYS)-1) {
-            g_laneGpa.store(lane_gpa);
-            LOG("auto-discovered LANE_GPA=%016llX — pipe server is streaming",
-                (unsigned long long)lane_gpa);
-        }
+        Sleep(1000);
     }
-
-done:
-    LOG("recon thread done — pipe server remains active");
-    // Do NOT close g_log — pipe clients still write to it.
-    // Do NOT return 0 and exit — just let this thread die; pipe server thread lives on.
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// DllMain — attach spawns recon thread; detach is intentionally ignored
-// ═══════════════════════════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────────────────────────────────────────
+// DllMain
+// ─────────────────────────────────────────────────────────────────────────────
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_ATTACH)
-        CreateThread(nullptr, 0, ReconThread, nullptr, 0, nullptr);
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_log = fopen(LOG_PATH, "w");
+        if (!g_log) return FALSE;
+        LOG("recon_android11 — BlueStacks 5 / Android 11 lane reader");
+        LOG("PID=%lu", GetCurrentProcessId());
 
-    // DLL_PROCESS_DETACH is intentionally NOT handled.
-    // FreeLibrary on this DLL will corrupt VBox VMM state and crash BlueStacks.
-    // Inject once. Leave it. If you need to update recon, restart BlueStacks.
+        CreateThread(nullptr, 0, PipeServerThread, nullptr, 0, nullptr);
+        CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    }
     return TRUE;
 }
