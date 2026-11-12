@@ -1,22 +1,21 @@
 /*
- * SubwayBot.cs  v4
+ * SubwayBot.cs  v5
  *
- * Changes from v3:
- *   - obstacle lookahead engine replacing probabilistic lane variation:
- *       · sends SCAN to recon every ScanIntervalMs
- *       · parses OBSTACLE <lane> <zDelta> / CHUNKS_DONE responses
- *       · BotDecideAndAct picks the nearest unblocked adjacent lane
- *         when a dangerous entity is within DangerZThreshold units ahead
- *       · falls back to probabilistic variation when no obstacles seen
- *         (keeps the game feeling human between obstacle bursts)
- *   - "scan" console command: manual single scan + dump
- *   - "obstacles" console command: print current obstacle snapshot
- *   - version bump to v4
+ * Changes from v4:
+ *   - jump and roll support: bot now sends JUMP / ROLL to recon
+ *   - obstacle decision engine extended to pick the right evasion action:
+ *       · Gate (4), MovingTrain (7), StaticTrain (8) → must JUMP or lane-change
+ *       · Blocker (1), Bush (2), Dumpster (3) → can ROLL under or lane-change
+ *       · Ramp (11) → lane-change only
+ *       · default heuristic: if same lane blocked in all adjacent options → JUMP
+ *   - "jump" console command: manual jump injection
+ *   - "roll" console command: manual roll injection
+ *   - version bump to v5
  *
- * Pipe protocol additions (recon v7+):
- *   Bot sends:  SCAN
- *   DLL sends:  OBSTACLE <lane> <zDelta>  (zero or more, nearest-first)
- *               CHUNKS_DONE
+ * Pipe protocol (recon v8+):
+ *   Bot sends:  SCAN | JUMP | ROLL | SWIPE <-1|0|1>
+ *   DLL sends:  LANE <n> | OBSTACLE <lane> <zDelta> | CHUNKS_DONE
+ *               OK | ERR ... | PONG
  *
  * Build: dotnet build -c Release
  * Run:   dotnet SubwayBot.dll
@@ -83,10 +82,10 @@ class SubwayBot
 
     static async Task Main(string[] args)
     {
-        Console.Title = "SubwayBot v4";
-        Console.WriteLine("SubwayBot v4 — obstacle lookahead engine");
+        Console.Title = "SubwayBot v5";
+        Console.WriteLine("SubwayBot v5 — obstacle lookahead + jump/roll");
         Console.WriteLine("Commands: setgpa <hex>  |  read  |  scan  |  obstacles  |  swipe -1/0/1");
-        Console.WriteLine("          ping  |  hvabase  |  manual  |  status  |  quit");
+        Console.WriteLine("          jump  |  roll  |  ping  |  hvabase  |  manual  |  status  |  quit");
         Console.WriteLine(new string('─', 60));
 
         var inputThread = new Thread(ConsoleInputLoop) { IsBackground = true };
@@ -201,9 +200,10 @@ class SubwayBot
             }
             else if (line.StartsWith("OBSTACLE "))
             {
-                // OBSTACLE <lane> <zDelta>
+                // OBSTACLE <lane> <zDelta> [<gameType>]
+                // GameType is optional — recon v8+ sends it, earlier versions don't.
                 var parts = line.Split(' ');
-                if (parts.Length == 3
+                if (parts.Length >= 3
                     && int.TryParse(parts[1], out int ol)
                     && float.TryParse(parts[2],
                            System.Globalization.NumberStyles.Float,
@@ -211,7 +211,10 @@ class SubwayBot
                            out float oz)
                     && oz <= LookAheadZ)
                 {
-                    pendingObs.Add(new ObstacleInfo(ol, oz));
+                    var gt = GameType.Unknown;
+                    if (parts.Length >= 4 && int.TryParse(parts[3], out int gti))
+                        gt = (GameType)gti;
+                    pendingObs.Add(new ObstacleInfo(ol, oz, gt));
                 }
             }
             else if (line == "CHUNKS_DONE")
@@ -291,19 +294,51 @@ class SubwayBot
 
         if (threat != null)
         {
-            int target = PickEscapeLane(lane, obs);
-            if (target != lane)
+            var evasion = EvasionFor(threat.Type);
+            int escapeLane = PickEscapeLane(lane, obs);
+            bool laneOpen  = escapeLane != lane;
+
+            switch (evasion)
             {
-                Console.WriteLine(
-                    $"[bot]  OBSTACLE {LaneName(lane)} Z+{threat.ZDelta:F0}" +
-                    $" → swipe {LaneName(target)}");
-                Swipe(target);
-                return;
+                case Evasion.Roll:
+                    // Roll under low obstacles if no clean lane available,
+                    // or if the lane change would be riskier.
+                    if (!laneOpen)
+                    {
+                        Console.WriteLine(
+                            $"[bot]  {threat.Type} in {LaneName(lane)} Z+{threat.ZDelta:F0} → ROLL");
+                        DoRoll();
+                        return;
+                    }
+                    goto case Evasion.LaneChange;
+
+                case Evasion.JumpOrLane:
+                    // Jump if no adjacent lane is open, otherwise lane-change.
+                    if (!laneOpen)
+                    {
+                        Console.WriteLine(
+                            $"[bot]  {threat.Type} in {LaneName(lane)} Z+{threat.ZDelta:F0} → JUMP");
+                        DoJump();
+                        return;
+                    }
+                    goto case Evasion.LaneChange;
+
+                case Evasion.LaneChange:
+                default:
+                    if (laneOpen)
+                    {
+                        Console.WriteLine(
+                            $"[bot]  {threat.Type} in {LaneName(lane)} Z+{threat.ZDelta:F0}" +
+                            $" → swipe {LaneName(escapeLane)}");
+                        Swipe(escapeLane);
+                        return;
+                    }
+                    // All lanes blocked — last resort jump to clear everything.
+                    Console.WriteLine(
+                        $"[bot]  all lanes blocked Z+{threat.ZDelta:F0} → JUMP");
+                    DoJump();
+                    return;
             }
-            // Both adjacent lanes also blocked — log it and fall through to
-            // probabilistic; at least we'll be moving.
-            Console.WriteLine(
-                $"[bot]  all lanes blocked near Z+{threat.ZDelta:F0}, random move");
         }
 
         // ── probabilistic fallback (unchanged from v3) ───────────────────────
@@ -390,6 +425,28 @@ class SubwayBot
         s_ticksOnLane = 0;
     }
 
+    static void DoJump()
+    {
+        long now = Environment.TickCount64;
+        if (now - s_lastSwipeMs < SwipeCooldownMs) return;
+        s_lastSwipeMs = now;
+        Interlocked.Increment(ref s_swipesPending);
+        Send("JUMP");
+        Console.WriteLine("[bot]  JUMP");
+        s_ticksOnLane = 0;
+    }
+
+    static void DoRoll()
+    {
+        long now = Environment.TickCount64;
+        if (now - s_lastSwipeMs < SwipeCooldownMs) return;
+        s_lastSwipeMs = now;
+        Interlocked.Increment(ref s_swipesPending);
+        Send("ROLL");
+        Console.WriteLine("[bot]  ROLL");
+        s_ticksOnLane = 0;
+    }
+
     // ── console input ─────────────────────────────────────────────────────────
 
     static void ConsoleInputLoop()
@@ -423,6 +480,16 @@ class SubwayBot
             {
                 Console.WriteLine("[cmd]  sending SCAN...");
                 Send("SCAN");
+            }
+            else if (line == "jump")
+            {
+                Console.WriteLine("[cmd]  sending JUMP...");
+                Send("JUMP");
+            }
+            else if (line == "roll")
+            {
+                Console.WriteLine("[cmd]  sending ROLL...");
+                Send("ROLL");
             }
             else if (line == "obstacles")
             {
@@ -475,7 +542,7 @@ class SubwayBot
             {
                 Console.WriteLine(
                     "commands: setgpa <hex>  |  read  |  scan  |  obstacles  |  start  |  stop" +
-                    "  |  ping  |  swipe -1/0/1  |  hvabase  |  manual  |  status  |  quit");
+                    "  |  ping  |  swipe -1/0/1  |  jump  |  roll  |  hvabase  |  manual  |  status  |  quit");
             }
         }
     }
@@ -489,5 +556,35 @@ class SubwayBot
 
     // ── types ─────────────────────────────────────────────────────────────────
 
-    record ObstacleInfo(int Lane, float ZDelta);
+    // GameType values from metadata v31 (EntityGameType enum).
+    enum GameType
+    {
+        Unknown     = 0,
+        Blocker     = 1,
+        Bush        = 2,
+        Dumpster    = 3,
+        Gate        = 4,
+        MovingTrain = 7,
+        StaticTrain = 8,
+        Ramp        = 11,
+    }
+
+    // Evasion strategy for a given obstacle type.
+    enum Evasion { LaneChange, Jump, Roll, JumpOrLane }
+
+    static Evasion EvasionFor(GameType gt) => gt switch {
+        // Trains and gates: you can jump over or dodge to another lane.
+        GameType.MovingTrain => Evasion.JumpOrLane,
+        GameType.StaticTrain => Evasion.JumpOrLane,
+        GameType.Gate        => Evasion.JumpOrLane,
+        // Low obstacles: roll under or dodge.
+        GameType.Blocker     => Evasion.Roll,
+        GameType.Bush        => Evasion.Roll,
+        GameType.Dumpster    => Evasion.Roll,
+        // Ramp: lane change only (rolling into a ramp is bad).
+        GameType.Ramp        => Evasion.LaneChange,
+        _                    => Evasion.LaneChange,
+    };
+
+    record ObstacleInfo(int Lane, float ZDelta, GameType Type = GameType.Unknown);
 }

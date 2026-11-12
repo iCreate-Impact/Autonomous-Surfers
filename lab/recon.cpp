@@ -30,9 +30,12 @@
  *   START\n           stream LANE lines on change -> OK, then LANE lines
  *   STOP\n            stop streaming              -> OK
  *   PING\n                                        -> PONG
+ *   SWIPE <-1|0|1>\n  lane change                 -> OK | ERR
+ *   JUMP\n            inject jump                 -> OK | ERR
+ *   ROLL\n            inject roll/slide           -> OK | ERR
  *   SCAN\n            one obstacle scan pass      -> OBSTACLE <lane> <z>\n ...
  *                                                    CHUNKS_DONE\n
- *                     (also handled inside START streaming loop)
+ *                     (SWIPE/JUMP/ROLL/SCAN also handled inside START loop)
  *   banner: STATUS READY HVA_BASE <hex>
  *
  * Injected once per BlueStacks session.  DLL_PROCESS_DETACH is intentionally
@@ -794,8 +797,45 @@ static bool LaneRead(int32_t* out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Guest write + lane injection
+// Guest write + lane / jump / roll injection
+//
+// Jump and roll offsets derived from probe 29 dword-change log (60s sampling
+// during live run with hoverboard loop keeping the game alive):
+//
+// JUMP — observed at t=17172ms in probe 29:
+//   +0x0D8  float  vertical velocity — ramps 0.2 -> 29.4 during jump arc.
+//                  Writing ~25.0 at the start of a jump is the trigger.
+//   +0x0E4  int32  movement state — 3=RunningState, 2=JumpingState, 0=FallingState.
+//                  Writing 2 alongside the velocity sets the jump in motion.
+//
+// ROLL — observed at t=2860ms in probe 29 (1800ms duration, right for roll):
+//   +0x144  bool   IsRolling flag inside _impactFrameState (+0x138+0x0C).
+//                  Writing 1 triggers the roll. Clears automatically after ~1.8s.
+//
+// _runStateInfo struct at +0x0D0 (field[26]):
+//   +0x0D0  bool   flag (toggles with state transitions)
+//   +0x0D4  float  transition elapsed time
+//   +0x0D8  float  vertical velocity / jump height
+//   +0x0DC  int32  flags: 0x100=running/not-rolling, 0x10000=in-jump
+//   +0x0E0  float  world position X (always changing)
+//   +0x0E4  int32  movement state enum
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Offsets within CharacterMotor for jump/roll (verified probe 29).
+static const uint32_t OFF_VERT_VEL    = 0x0D8;  // float — vertical velocity
+static const uint32_t OFF_MOVE_STATE  = 0x0E4;  // int32 — movement state enum
+static const uint32_t OFF_IS_ROLLING  = 0x144;  // bool  — roll active flag
+
+// Movement state enum values.
+static const int32_t MSTATE_RUNNING = 3;
+static const int32_t MSTATE_JUMPING = 2;
+static const int32_t MSTATE_FALLING = 0;
+
+// Initial vertical velocity injected on jump.
+// Probe 29 showed peak ~29.4; starting at 25.0f gives a natural arc.
+// Tune upward if the jump feels too low.
+static const float JUMP_INITIAL_VEL = 25.0f;
+
 static bool GuestWrite(uint64_t gpa, const void* src, size_t len)
 {
     if (!g_fnWrite || !g_pVM) return false;
@@ -806,6 +846,16 @@ static bool GuestWrite32(uint64_t gpa, uint32_t v) { return GuestWrite(gpa, &v, 
 static bool GuestWrite8 (uint64_t gpa, uint8_t  v) { return GuestWrite(gpa, &v, 1); }
 static bool GuestWriteF (uint64_t gpa, float    v) { return GuestWrite(gpa, &v, 4); }
 
+static uint64_t GetMotorGpa()
+{
+    uint64_t motor = g_motorGpa.load();
+    if (!motor) {
+        if (!g_useUserGpa.load() || !g_userGpa.load()) return 0;
+        motor = g_userGpa.load() - offLaneState - offTargetLane;
+    }
+    return motor;
+}
+
 static bool SwipeLane(int32_t lane)
 {
     LOG("swipe: g_fnWrite=%p g_pVM=%p motor=%016llX",
@@ -813,11 +863,8 @@ static bool SwipeLane(int32_t lane)
         (unsigned long long)g_motorGpa.load());
     if (lane < -1 || lane > 1) return false;
 
-    uint64_t motor = g_motorGpa.load();
-    if (!motor) {
-        if (!g_useUserGpa.load() || !g_userGpa.load()) return false;
-        motor = g_userGpa.load() - offLaneState - offTargetLane;
-    }
+    uint64_t motor = GetMotorGpa();
+    if (!motor) return false;
 
     uint64_t laneStateBase = motor + offLaneState;
 
@@ -829,6 +876,41 @@ static bool SwipeLane(int32_t lane)
 
     LOG("swipe: lane=%d motor=%016llX -> %s",
         lane, (unsigned long long)motor, ok ? "OK" : "PARTIAL");
+    return ok;
+}
+
+// Inject a jump: set vertical velocity and movement state to JumpingState.
+// The game's physics loop takes over from there; no need to clear manually.
+static bool SwipeJump()
+{
+    uint64_t motor = GetMotorGpa();
+    if (!motor) {
+        LOG("jump: no motor GPA");
+        return false;
+    }
+
+    bool ok = GuestWriteF(motor + OFF_VERT_VEL, JUMP_INITIAL_VEL);
+    ok &= GuestWrite32(motor + OFF_MOVE_STATE, (uint32_t)MSTATE_JUMPING);
+
+    LOG("jump: motor=%016llX vel=%.1f state=2 -> %s",
+        (unsigned long long)motor, JUMP_INITIAL_VEL, ok ? "OK" : "PARTIAL");
+    return ok;
+}
+
+// Inject a roll: set the IsRolling flag inside _impactFrameState.
+// The game clears it automatically after the roll animation completes (~1.8s).
+static bool SwipeRoll()
+{
+    uint64_t motor = GetMotorGpa();
+    if (!motor) {
+        LOG("roll: no motor GPA");
+        return false;
+    }
+
+    bool ok = GuestWrite8(motor + OFF_IS_ROLLING, 1);
+
+    LOG("roll: motor=%016llX isRolling=1 -> %s",
+        (unsigned long long)motor, ok ? "OK" : "PARTIAL");
     return ok;
 }
 
@@ -1096,7 +1178,16 @@ static uint64_t FindInstanceOfClass7(const ClassInfo& ci)
 }
 
 // Initialize Stage 7: find ChunkBuilder instance GPA.
-// Called lazily on first SCAN command if g_chunkBuilderGpa == 0.
+// Cached MRGS instance GPA — avoids re-running FindInstanceOfClass7 every SCAN.
+// Reset to 0 in ResetDiscovery.
+static std::atomic<uint64_t> g_mrgsInstGpa { 0 };
+
+// Backoff counter: if FindClassByName7 fails (class page paged out), don't
+// hammer the full guest RAM scan on every SCAN call.  Wait BackoffScans calls.
+static std::atomic<int> g_stage7Backoff { 0 };
+static const int kStage7BackoffScans = 8;   // ~0.8s at 100ms scan interval
+
+// Called lazily on first SCAN command (or after cache invalidation).
 static bool Stage7Init()
 {
     if (!g_cm.ok) {
@@ -1104,40 +1195,85 @@ static bool Stage7Init()
         return false;
     }
 
-    // Find MainRouteGenerationSystem class (fc=0 -> skip fc check; only
-    // confirmed field is ChunkBuilder at +0x10).
+    // Backoff: if the class was recently not-found, skip a few calls before
+    // retrying to avoid hammering FindStringHitsN on every SCAN tick.
+    int backoff = g_stage7Backoff.load();
+    if (backoff > 0) {
+        g_stage7Backoff.store(backoff - 1);
+        return false;
+    }
+
+    // Find MainRouteGenerationSystem class.
+    // fc=0 skips the field-count check; we only confirmed ChunkBuilder at +0x10.
     ClassInfo mrgs;
     if (!FindClassByName7("MainRouteGenerationSystem", 0, &mrgs)) {
-        LOG("stage7: MainRouteGenerationSystem class not found");
+        LOG("stage7: MainRouteGenerationSystem class not found (page paged out?) — backing off %d scans",
+            kStage7BackoffScans);
+        g_stage7Backoff.store(kStage7BackoffScans);
         return false;
     }
 
-    // Find its live instance.
-    uint64_t mrgsInst = FindInstanceOfClass7(mrgs);
+    // Use cached MRGS instance if we already have one and it still looks live.
+    uint64_t mrgsInst = g_mrgsInstGpa.load();
+    if (mrgsInst) {
+        // Quick liveness check: klass ptr at object+0x00 must still be valid.
+        uint64_t klass = 0;
+        GuestRead64(mrgsInst, &klass);
+        if (!klass) {
+            LOG("stage7: cached MRGS instance stale, re-discovering");
+            mrgsInst = 0;
+            g_mrgsInstGpa.store(0);
+        }
+    }
+
     if (!mrgsInst) {
-        LOG("stage7: MainRouteGenerationSystem instance not found");
-        return false;
-    }
-    LOG("stage7: MainRouteGenerationSystem instance GPA=%016llX",
-        (unsigned long long)mrgsInst);
-
-    // Read ChunkBuilder ref at instance+0x10.
-    uint64_t cb = S7ReadPtr(mrgsInst + 0x10);
-    if (!cb) {
-        LOG("stage7: ChunkBuilder ptr at MRGS+0x10 is null");
-        return false;
+        mrgsInst = FindInstanceOfClass7(mrgs);
+        if (!mrgsInst) {
+            LOG("stage7: MainRouteGenerationSystem instance not found");
+            g_stage7Backoff.store(kStage7BackoffScans);
+            return false;
+        }
+        g_mrgsInstGpa.store(mrgsInst);
+        LOG("stage7: MainRouteGenerationSystem instance GPA=%016llX",
+            (unsigned long long)mrgsInst);
     }
 
-    // Quick sanity: _chunks (List<Chunk>) at cb+0x28 should be non-null.
-    uint64_t chunks = S7ReadPtr(cb + 0x28);
-    if (!chunks) {
-        LOG("stage7: ChunkBuilder._chunks is null at GPA=%016llX", (unsigned long long)cb);
+    // Read ChunkBuilder GVA at instance+0x10.
+    // il2cpp stores object references as guest virtual addresses (GVAs), so we
+    // must translate through g_cr3 before reading any fields on the object.
+    uint64_t cbGva = S7ReadPtr(mrgsInst + 0x10);
+    if (!cbGva) {
+        LOG("stage7: ChunkBuilder GVA at MRGS+0x10 is null");
         return false;
     }
 
-    g_chunkBuilderGpa.store(cb);
-    LOG("stage7: ChunkBuilder GPA=%016llX _chunks=%016llX",
-        (unsigned long long)cb, (unsigned long long)chunks);
+    uint64_t cbGpa = 0;
+    if (!X64Translate(g_cr3, cbGva, &cbGpa, nullptr)) {
+        LOG("stage7: ChunkBuilder GVA=%016llX not mapped in CR3=%016llX",
+            (unsigned long long)cbGva, (unsigned long long)g_cr3);
+        return false;
+    }
+
+    // Sanity: _chunks (List<Chunk>) at cbGpa+0x28 must be a non-null GVA.
+    uint64_t chunksGva = S7ReadPtr(cbGpa + 0x28);
+    if (!chunksGva) {
+        LOG("stage7: ChunkBuilder._chunks GVA null at cbGpa=%016llX (run not started?)",
+            (unsigned long long)cbGpa);
+        // Don't backoff hard here — _chunks populates once a run starts.
+        return false;
+    }
+
+    // Verify _chunks is actually mapped — if not, the run hasn't loaded chunks yet.
+    uint64_t chunksGpa = 0;
+    if (!X64Translate(g_cr3, chunksGva, &chunksGpa, nullptr)) {
+        LOG("stage7: _chunks GVA=%016llX not yet mapped", (unsigned long long)chunksGva);
+        return false;
+    }
+
+    g_chunkBuilderGpa.store(cbGpa);
+    LOG("stage7: ChunkBuilder cbGva=%016llX cbGpa=%016llX _chunksGva=%016llX OK",
+        (unsigned long long)cbGva, (unsigned long long)cbGpa,
+        (unsigned long long)chunksGva);
     return true;
 }
 
@@ -1166,21 +1302,27 @@ static std::vector<ObstacleHit> ScanObstacles()
     uint64_t cb = g_chunkBuilderGpa.load();
     if (!cb) return results;
 
-    // Validate ChunkBuilder is still alive: _chunks ptr must be non-null.
-    uint64_t chunkListGpa = S7ReadPtr(cb + 0x28);
-    if (!chunkListGpa) {
-        LOG("stage7 scan: _chunks null, re-discovering ChunkBuilder");
+    // cb is already a GPA (Stage7Init translated it).
+    // _chunks at cb+0x28 is a GVA — il2cpp stores all object refs as GVAs.
+    uint64_t chunksGva = S7ReadPtr(cb + 0x28);
+    if (!chunksGva) {
+        LOG("stage7 scan: _chunks GVA null, invalidating ChunkBuilder");
         g_chunkBuilderGpa.store(0);
         return results;
     }
 
-    // List<Chunk> (Mono/il2cpp arm64):
-    //   +0x10 -> T[] _items  (array object GPA — this is already a GPA in
-    //            guest physical space because the DLL reads via PGMPhysSimpleRead)
+    // Translate List<Chunk> GVA -> GPA.
+    uint64_t chunkListGpa = 0;
+    if (!X64Translate(g_cr3, chunksGva, &chunkListGpa, nullptr)) {
+        LOG("stage7 scan: _chunks GVA=%016llX not mapped", (unsigned long long)chunksGva);
+        g_chunkBuilderGpa.store(0);
+        return results;
+    }
+
+    // List<T> layout (Mono/il2cpp, x86_64 guest):
+    //   +0x10 -> T[] _items  (GVA of the backing array object)
     //   +0x18 -> int32 _size
-    // Note: in arm64 il2cpp inside the guest, all object pointers the runtime
-    // stores are GVAs.  We translate each one before reading fields.
-    uint64_t itemsGva  = S7ReadPtr(chunkListGpa + 0x10);
+    uint64_t itemsGva   = S7ReadPtr(chunkListGpa + 0x10);
     int32_t  chunkCount = S7ReadI32(chunkListGpa + 0x18);
     if (!itemsGva || chunkCount <= 0 || chunkCount > 64) return results;
 
@@ -1378,6 +1520,14 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
                             PipeSend(pipe, "ERR bad lane\n");
                         }
                     }
+                    else if (strcmp(cmd, "JUMP") == 0) {
+                        bool ok = SwipeJump();
+                        PipeSend(pipe, ok ? "OK\n" : "ERR jump failed\n");
+                    }
+                    else if (strcmp(cmd, "ROLL") == 0) {
+                        bool ok = SwipeRoll();
+                        PipeSend(pipe, ok ? "OK\n" : "ERR roll failed\n");
+                    }
                     else if (strcmp(cmd, "SCAN") == 0) {
                         HandleScan(pipe);
                     }
@@ -1397,6 +1547,14 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
             } else {
                 if (!PipeSend(pipe, "ERR bad lane (expect -1 0 1)\n")) break;
             }
+        }
+        else if (strcmp(buf, "JUMP") == 0) {
+            bool ok = SwipeJump();
+            if (!PipeSend(pipe, ok ? "OK\n" : "ERR jump failed\n")) break;
+        }
+        else if (strcmp(buf, "ROLL") == 0) {
+            bool ok = SwipeRoll();
+            if (!PipeSend(pipe, ok ? "OK\n" : "ERR roll failed\n")) break;
         }
         else if (strcmp(buf, "SCAN") == 0) {
             HandleScan(pipe);
@@ -1455,6 +1613,8 @@ static void ResetDiscovery()
     g_autoLaneGpa.store(0);
     // Stage 7
     g_chunkBuilderGpa.store(0);
+    g_mrgsInstGpa.store(0);
+    g_stage7Backoff.store(0);
     g_cbClass = {};
 }
 
