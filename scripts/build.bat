@@ -108,7 +108,6 @@ if not exist "%BOT_SRC%" (
     goto summary
 )
 
-copy /Y "%BOT_SRC%" "%BOT_PROG%" >nul
 if errorlevel 1 (
     echo [bot] ERROR: copy failed
     set "BOT_OK=0"
