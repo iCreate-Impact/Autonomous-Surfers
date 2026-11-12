@@ -194,35 +194,22 @@ class SubwayBot
 
     static void BotLoop()
     {
-        int prevLane = 999;
         while (s_running)
         {
             if (s_laneValid)
-            {
-                int lane = s_currentLane;
-                if (lane != prevLane)
-                {
-                    BotReact(lane);
-                    prevLane = lane;
-                }
-            }
+                BotDecideAndAct();
             Thread.Sleep(16);
         }
     }
 
-    static void BotReact(int lane)
+    static void BotDecideAndAct()
     {
-        // lane is TargetLane — where the player is moving TO.
-        // Phase 1: just steer back to center whenever they drift.
-        int target = DecideTarget(lane);
-        if (target != lane)
-            Swipe(target);
-    }
+        int lane = s_currentLane;
 
-    static int DecideTarget(int currentLane)
-    {
-        if (currentLane == 0) return 0;
-        return 0;
+        // phase 1: always try to stay center
+        // replace this with obstacle lookahead in phase 2
+        if (lane != 0)
+            Swipe(0);
     }
 
     static void Swipe(int targetLane)
