@@ -1,7 +1,7 @@
 /*
  * recon_android11.cpp — guest-RAM lane reader for BlueStacks 5 / Android 11
  *
- * Six-stage pipeline (all self-discovered; no hard-coded session addresses):
+ * Seven-stage pipeline (all self-discovered; no hard-coded session addresses):
  *
  *   STAGE 1  VBox VMM bridge      BstkVMM.dll exports + UVM discovery
  *   STAGE 2  guest RAM range map  PGM RAM-range list (corrected Android 11 layout)
@@ -17,16 +17,22 @@
  *                                 (monitor==0, lane in range, bools, velocity)
  *                                 and pick the input-driven player motor
  *   STAGE 6  lane streaming       \\.\pipe\recon  LANE -1/0/1
+ *   STAGE 7  obstacle lookahead   ChunkBuilder -> _chunks -> SubwayChunk.Entities
+ *                                 -> EntityType.GameType; emits OBSTACLE <lane>
+ *                                 <z_delta> lines on SCAN command
  *
  * Field offsets are read from the live FieldInfo arrays by name, so this is
  * not tied to the verified fallback constants (kept for diagnostics only).
  *
- * Pipe protocol (unchanged from recon.cpp v12):
+ * Pipe protocol:
  *   SET_GPA <hex>\n   override the lane GPA       -> OK | ERR
  *   READ\n            read the current lane       -> LANE <n> | LANE ? | ERR
  *   START\n           stream LANE lines on change -> OK, then LANE lines
  *   STOP\n            stop streaming              -> OK
  *   PING\n                                        -> PONG
+ *   SCAN\n            one obstacle scan pass      -> OBSTACLE <lane> <z>\n ...
+ *                                                    CHUNKS_DONE\n
+ *                     (also handled inside START streaming loop)
  *   banner: STATUS READY HVA_BASE <hex>
  *
  * Injected once per BlueStacks session.  DLL_PROCESS_DETACH is intentionally
@@ -116,6 +122,395 @@ static uint32_t offChanging = FB_CHANGING;
 // Bridge write export: available alongside the read export in BstkVMM.dll.
 typedef int (__cdecl *PFN_PGM_WRITE)(PUVM, uint64_t, const void*, size_t);
 static PFN_PGM_WRITE g_pfnWrite = nullptr;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 7 — obstacle lookahead
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ChunkBuilder (TypeDefIndex 256) has fc=4 instance fields:
+//   +0x10  Vector3  _nextAnchorPosition
+//   +0x20  UnityPoolCollection _chunkPool
+//   +0x28  List<Chunk> _chunks              <- we walk this
+//   +0x30  float <CleanupDistance>k__BackingField
+//
+// Dangerous EntityGameType values (confirmed in metadata v31):
+enum class GameType : int32_t {
+    Blocker     = 1,
+    Bush        = 2,
+    Dumpster    = 3,
+    Gate        = 4,
+    MovingTrain = 7,
+    StaticTrain = 8,
+    Ramp        = 11,
+};
+
+static bool IsDangerous(int32_t gt)
+{
+    switch (static_cast<GameType>(gt)) {
+        case GameType::Blocker:
+        case GameType::Bush:
+        case GameType::Dumpster:
+        case GameType::Gate:
+        case GameType::MovingTrain:
+        case GameType::StaticTrain:
+        case GameType::Ramp:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Cached ChunkBuilder GPA; re-validated each SCAN by checking _chunks ptr.
+static std::atomic<uint64_t> g_chunkBuilderGpa { 0 };
+// ChunkBuilder class object (discovered in Stage 7 init).
+static ClassInfo g_cbClass;
+
+struct ObstacleHit {
+    int   lane;     // -1 / 0 / 1
+    float zDelta;   // entity world Z - player world Z (positive = ahead)
+};
+
+// ── safe read helpers for Stage 7 ────────────────────────────────────────────
+// (GuestRead already exists for GPA reads; these are thin typed wrappers)
+static uint64_t S7ReadPtr(uint64_t gpa)
+{
+    uint64_t v = 0;
+    GuestRead(gpa, &v, 8);
+    return v;
+}
+static int32_t S7ReadI32(uint64_t gpa)
+{
+    int32_t v = 0;
+    GuestRead(gpa, &v, 4);
+    return v;
+}
+static float S7ReadF32(uint64_t gpa)
+{
+    float v = 0.f;
+    GuestRead(gpa, &v, 4);
+    return v;
+}
+
+// ── Stage 7 class / instance discovery ───────────────────────────────────────
+//
+// ChunkBuilder is not a MonoBehaviour singleton — it is owned by
+// MainRouteGenerationSystem which holds it at field +0x10 (confirmed from
+// dump.cs line 51364: "public ChunkBuilder ChunkBuilder; // 0x10").
+//
+// Discovery path:
+//   1. Find ChunkBuilder Il2CppClass by scanning for its metadata name pointer
+//      (metaBase + offset-of-"ChunkBuilder" in the string heap).
+//   2. Find MainRouteGenerationSystem instances using the same class-pointer
+//      heap scan used for CharacterMotor.
+//   3. Read instance+0x10 -> ChunkBuilder GPA.
+//
+// The metadata name offset for ChunkBuilder is not pre-computed here because
+// it isn't in our existing OFF_* constants.  Instead we scan by string content
+// (same approach Stage 4 uses for LaneStateInfo lookup by field type).
+
+// Find an Il2CppClass for a named class starting from the already-found
+// CharacterMotor class GPA.  We scan the same set of class-pointer QWORDs
+// that Stage 4 found for CharacterMotor and check the name field (+0x10)
+// against a GVA string read.  Scales fine for small class sets.
+static bool FindClassByName7(const char* name, uint32_t expectedFc,
+                             ClassInfo* out)
+{
+    if (!g_cm.ok || g_cr3 == 0 || g_metaBase == 0) return false;
+
+    // We don't know the name offset in the string heap, so we scan every
+    // candidate class object we can reach: walk the QWORDs in a window around
+    // the CharacterMotor class GPA — il2cpp lays type definitions contiguously.
+    // Scan ±4096 class slots (each slot is a pointer, 8 bytes; type table is
+    // a contiguous C array of Il2CppClass*).
+    // Better approach: scan all QWORD values in guest RAM for pointers whose
+    // target has name == the class name.  We use FindQwordsAny with a window.
+
+    // Step 1: scan the metadata string heap for the class name string.
+    const char* needle = name;
+    size_t nl = strlen(needle) + 1;
+    auto nameHits = FindStringHitsN(needle, nl, 256);
+    if (nameHits.empty()) {
+        LOG("stage7 FindClass(%s): name string not found in guest RAM", name);
+        return false;
+    }
+
+    // Step 2: for each hit, treat it as a possible name GVA if it's
+    // mapped in g_cr3.  For each one, scan for QWORD references to that
+    // GPA (potential Il2CppClass+0x10 name fields).
+    for (uint64_t nameGpa : nameHits) {
+        // Find class structs whose +0x10 name pointer == nameGpa (GPA match).
+        // The name pointer is a GVA in the same process, but Il2CppClass stores
+        // the GVA.  We need to find QWORD == GVA_of_name in guest RAM.
+        // Map nameGpa -> GVA candidates.
+        uint64_t namePage = nameGpa & ~0xFFFULL;
+        auto w = WalkCr3ForPages(g_cr3, { namePage });
+        auto it = w.find(namePage);
+        if (it == w.end()) continue;
+
+        for (uint64_t pageGva : it->second) {
+            uint64_t nameGva = pageGva | (nameGpa & 0xFFF);
+            if (nameGva >= 0x800000000000ULL) continue;
+
+            // Find all QWORD refs to nameGva in guest RAM.
+            auto refs = FindQwordsAny({ nameGva }, 2048);
+            for (uint64_t refGpa : refs) {
+                // The name field is at Il2CppClass+0x10, so the class base is
+                // refGpa - 0x10 (same logic as ValidateClassAt in Stage 4).
+                if (refGpa < 0x10) continue;
+                uint64_t clsGpa = refGpa - 0x10;
+
+                uint16_t fc = 0;
+                GuestRead(clsGpa + 0x124, &fc, 2);
+                if (expectedFc > 0 && fc != expectedFc) continue;
+                if (fc == 0 || fc > 512) continue;
+
+                uint64_t fields = 0;
+                GuestRead64(clsGpa + 0x80, &fields);
+                if (!fields) continue;
+
+                uint64_t fgpa = 0;
+                if (!X64Translate(g_cr3, fields, &fgpa, nullptr)) continue;
+
+                out->gpa        = clsGpa;
+                out->fields_gpa = fgpa;
+                out->name_ptr   = nameGva;
+                out->fc         = fc;
+                out->ok         = true;
+                LOG("stage7 FindClass(%s): class GPA=%016llX fc=%u",
+                    name, (unsigned long long)clsGpa, fc);
+                return true;
+            }
+        }
+    }
+    LOG("stage7 FindClass(%s): not found", name);
+    return false;
+}
+
+// Find a live instance of a named class by scanning for objects whose
+// klass pointer (object+0x00) points to that class GPA.
+static uint64_t FindInstanceOfClass7(const ClassInfo& ci)
+{
+    if (!ci.ok) return 0;
+
+    // Build a set of all GVAs mapping the class's GPA page.
+    uint64_t clsPage = ci.gpa & ~0xFFFULL;
+    auto w = WalkCr3ForPages(g_cr3, { clsPage });
+    auto it = w.find(clsPage);
+    if (it == w.end()) return 0;
+
+    std::set<uint64_t> classPtrGvas;
+    for (uint64_t pageGva : it->second)
+        classPtrGvas.insert(pageGva | (ci.gpa & 0xFFF));
+
+    if (classPtrGvas.empty()) return 0;
+
+    // Scan guest RAM for QWORD == any of those GVAs (potential klass fields).
+    auto hits = FindQwordsAny(classPtrGvas, 4096);
+    for (uint64_t hitGpa : hits) {
+        // Object layout: [+0x00 klass GVA][+0x08 monitor == 0][...]
+        uint64_t monitor = 1;
+        GuestRead64(hitGpa + 8, &monitor);
+        if (monitor != 0) continue;
+        return hitGpa;
+    }
+    return 0;
+}
+
+// Initialize Stage 7: find ChunkBuilder instance GPA.
+// Called lazily on first SCAN command if g_chunkBuilderGpa == 0.
+static bool Stage7Init()
+{
+    if (!g_cm.ok) {
+        LOG("stage7: Stage 4 not complete, deferring");
+        return false;
+    }
+
+    // Find MainRouteGenerationSystem class (fc=0 -> skip fc check; only
+    // confirmed field is ChunkBuilder at +0x10).
+    ClassInfo mrgs;
+    if (!FindClassByName7("MainRouteGenerationSystem", 0, &mrgs)) {
+        LOG("stage7: MainRouteGenerationSystem class not found");
+        return false;
+    }
+
+    // Find its live instance.
+    uint64_t mrgsInst = FindInstanceOfClass7(mrgs);
+    if (!mrgsInst) {
+        LOG("stage7: MainRouteGenerationSystem instance not found");
+        return false;
+    }
+    LOG("stage7: MainRouteGenerationSystem instance GPA=%016llX",
+        (unsigned long long)mrgsInst);
+
+    // Read ChunkBuilder ref at instance+0x10.
+    uint64_t cb = S7ReadPtr(mrgsInst + 0x10);
+    if (!cb) {
+        LOG("stage7: ChunkBuilder ptr at MRGS+0x10 is null");
+        return false;
+    }
+
+    // Quick sanity: _chunks (List<Chunk>) at cb+0x28 should be non-null.
+    uint64_t chunks = S7ReadPtr(cb + 0x28);
+    if (!chunks) {
+        LOG("stage7: ChunkBuilder._chunks is null at GPA=%016llX", (unsigned long long)cb);
+        return false;
+    }
+
+    g_chunkBuilderGpa.store(cb);
+    LOG("stage7: ChunkBuilder GPA=%016llX _chunks=%016llX",
+        (unsigned long long)cb, (unsigned long long)chunks);
+    return true;
+}
+
+// Read player world Z from CharacterMotor transform.
+// MonoBehaviour caches its Transform at object+0x10 (CacheBehavior pattern).
+// Transform.m_LocalPosition is at transform+0x90 on arm64 il2cpp (Vector3,
+// x at +0x90, y at +0x94, z at +0x98).
+static float ReadPlayerZ()
+{
+    uint64_t motor = g_motorGpa.load();
+    if (!motor) return 0.f;
+    uint64_t xform = S7ReadPtr(motor + 0x10);
+    if (!xform) return 0.f;
+    // Translate GVA -> GPA for the Transform object.
+    uint64_t xformGpa = 0;
+    if (!X64Translate(g_cr3, xform, &xformGpa, nullptr)) return 0.f;
+    return S7ReadF32(xformGpa + 0x98);
+}
+
+// Core scan: walk ChunkBuilder._chunks, read SubwayChunk.Entities,
+// filter dangerous EntityType.GameType, derive lane and Z delta.
+static std::vector<ObstacleHit> ScanObstacles()
+{
+    std::vector<ObstacleHit> results;
+
+    uint64_t cb = g_chunkBuilderGpa.load();
+    if (!cb) return results;
+
+    // Validate ChunkBuilder is still alive: _chunks ptr must be non-null.
+    uint64_t chunkListGpa = S7ReadPtr(cb + 0x28);
+    if (!chunkListGpa) {
+        LOG("stage7 scan: _chunks null, re-discovering ChunkBuilder");
+        g_chunkBuilderGpa.store(0);
+        return results;
+    }
+
+    // List<Chunk> (Mono/il2cpp arm64):
+    //   +0x10 -> T[] _items  (array object GPA — this is already a GPA in
+    //            guest physical space because the DLL reads via PGMPhysSimpleRead)
+    //   +0x18 -> int32 _size
+    // Note: in arm64 il2cpp inside the guest, all object pointers the runtime
+    // stores are GVAs.  We translate each one before reading fields.
+    uint64_t itemsGva  = S7ReadPtr(chunkListGpa + 0x10);
+    int32_t  chunkCount = S7ReadI32(chunkListGpa + 0x18);
+    if (!itemsGva || chunkCount <= 0 || chunkCount > 64) return results;
+
+    uint64_t itemsGpa = 0;
+    if (!X64Translate(g_cr3, itemsGva, &itemsGpa, nullptr)) return results;
+
+    float playerZ = ReadPlayerZ();
+
+    for (int ci = 0; ci < chunkCount; ++ci) {
+        // Array element pointer at +0x20 + ci*8 (array data starts at +0x20
+        // in a Mono object array; first 0x20 bytes are object header + length).
+        uint64_t chunkGva = S7ReadPtr(itemsGpa + 0x20 + (uint64_t)ci * 8);
+        if (!chunkGva) continue;
+
+        uint64_t chunkGpa = 0;
+        if (!X64Translate(g_cr3, chunkGva, &chunkGpa, nullptr)) continue;
+
+        // SubwayChunk.Entities backing field at +0x138.
+        uint64_t entityListGva = S7ReadPtr(chunkGpa + 0x138);
+        if (!entityListGva) continue;
+
+        uint64_t entityListGpa = 0;
+        if (!X64Translate(g_cr3, entityListGva, &entityListGpa, nullptr)) continue;
+
+        uint64_t entityArrayGva = S7ReadPtr(entityListGpa + 0x10);
+        int32_t  entityCount    = S7ReadI32(entityListGpa + 0x18);
+        if (!entityArrayGva || entityCount <= 0 || entityCount > 256) continue;
+
+        uint64_t entityArrayGpa = 0;
+        if (!X64Translate(g_cr3, entityArrayGva, &entityArrayGpa, nullptr)) continue;
+
+        for (int ei = 0; ei < entityCount; ++ei) {
+            uint64_t entityGva = S7ReadPtr(entityArrayGpa + 0x20 + (uint64_t)ei * 8);
+            if (!entityGva) continue;
+
+            uint64_t entityGpa = 0;
+            if (!X64Translate(g_cr3, entityGva, &entityGpa, nullptr)) continue;
+
+            // SubwayEntity._entityType at +0x88 (pointer to EntityType object).
+            uint64_t entityTypeGva = S7ReadPtr(entityGpa + 0x88);
+            if (!entityTypeGva) continue;
+
+            uint64_t entityTypeGpa = 0;
+            if (!X64Translate(g_cr3, entityTypeGva, &entityTypeGpa, nullptr)) continue;
+
+            // EntityType.GameType at +0x24.
+            int32_t gameType = S7ReadI32(entityTypeGpa + 0x24);
+            if (!IsDangerous(gameType)) continue;
+
+            // SpawnLocation.SpawnZ at +0x98 (subclass of SubwayEntity).
+            // If this entity is not a SpawnLocation the value may be garbage;
+            // we validate it falls in a plausible world Z range.
+            float spawnZ = S7ReadF32(entityGpa + 0x98);
+            if (spawnZ < -20000.f || spawnZ > 20000.f) continue;
+
+            float zDelta = spawnZ - playerZ;
+            // Only obstacles ahead of the player within 300 units.
+            if (zDelta < 0.f || zDelta > 300.f) continue;
+
+            // Determine lane from entity X position.
+            // MonoBehaviour caches transform at +0x10 (CacheBehavior).
+            // Transform.m_LocalPosition.x at transform+0x90.
+            // Lane thresholds (tune after first live scan):
+            //   X < -1.5 -> LEFT (-1), X > 1.5 -> RIGHT (1), else CENTER (0).
+            int lane = 0;
+            uint64_t xformGva = S7ReadPtr(entityGpa + 0x10);
+            if (xformGva) {
+                uint64_t xformGpa = 0;
+                if (X64Translate(g_cr3, xformGva, &xformGpa, nullptr)) {
+                    float entityX = S7ReadF32(xformGpa + 0x90);
+                    if (entityX < -1.5f)      lane = -1;
+                    else if (entityX > 1.5f)  lane =  1;
+                }
+            }
+
+            results.push_back({ lane, zDelta });
+        }
+    }
+
+    // Sort nearest-first so the bot always sees the most urgent threat first.
+    std::sort(results.begin(), results.end(),
+        [](const ObstacleHit& a, const ObstacleHit& b) {
+            return a.zDelta < b.zDelta;
+        });
+
+    LOG("stage7 scan: playerZ=%.1f obstacles=%zu", playerZ, results.size());
+    return results;
+}
+
+// Emit one SCAN response over the pipe.
+// Sends OBSTACLE lines (sorted nearest-first) then CHUNKS_DONE.
+static void HandleScan(HANDLE pipe)
+{
+    // Lazy init Stage 7 if not yet done.
+    if (g_chunkBuilderGpa.load() == 0) {
+        if (!Stage7Init()) {
+            PipeSend(pipe, "CHUNKS_DONE\n");
+            return;
+        }
+    }
+
+    auto obs = ScanObstacles();
+    char buf[64];
+    for (const auto& o : obs) {
+        snprintf(buf, sizeof(buf), "OBSTACLE %d %.2f\n", o.lane, o.zDelta);
+        if (!PipeSend(pipe, buf)) return;
+    }
+    PipeSend(pipe, "CHUNKS_DONE\n");
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Guest RAM scanning
@@ -983,6 +1378,9 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
                             PipeSend(pipe, "ERR bad lane\n");
                         }
                     }
+                    else if (strcmp(cmd, "SCAN") == 0) {
+                        HandleScan(pipe);
+                    }
                 }
                 Sleep(16);
             }
@@ -999,6 +1397,9 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
             } else {
                 if (!PipeSend(pipe, "ERR bad lane (expect -1 0 1)\n")) break;
             }
+        }
+        else if (strcmp(buf, "SCAN") == 0) {
+            HandleScan(pipe);
         }
         else {
             char resp[160];
@@ -1052,6 +1453,9 @@ static void ResetDiscovery()
     g_cmClassPtrs.clear();
     g_motorGpa.store(0);
     g_autoLaneGpa.store(0);
+    // Stage 7
+    g_chunkBuilderGpa.store(0);
+    g_cbClass = {};
 }
 
 static DWORD WINAPI WorkerThread(LPVOID)
