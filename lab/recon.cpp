@@ -801,6 +801,9 @@ static bool GuestWriteF (uint64_t gpa, float    v) { return GuestWrite(gpa, &v, 
 
 static bool SwipeLane(int32_t lane)
 {
+    LOG("swipe: g_pfnWrite=%p g_pUVM=%p motor=%016llX",
+        (void*)g_pfnWrite, (void*)g_pUVM,
+        (unsigned long long)g_motorGpa.load());
     if (lane < -1 || lane > 1) return false;
 
     uint64_t motor = g_motorGpa.load();

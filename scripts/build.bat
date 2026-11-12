@@ -22,7 +22,7 @@ set "LAB=%ROOT%\lab"
 set "RECON_SRC=%LAB%\recon.cpp"
 set "RECON_DLL=%LAB%\recon.dll"
 set "BOT_DIR=%LAB%\SubwayBot"
-set "BOT_EXE=%BOT_DIR%\bin\x64\Release\net8.0\SubwayBot.exe"
+set "BOT_EXE=%BOT_DIR%\bin\Release\net8.0\SubwayBot.exe"
 set "BOT_SRC=%LAB%\SubwayBot.cs"
 set "BOT_PROG=%BOT_DIR%\Program.cs"
 

@@ -272,6 +272,18 @@ class SubwayBot
             {
                 s_writer?.WriteLine("READ");
             }
+            else if (line == "ping")
+            {
+                s_writer?.WriteLine("PING");
+            }
+            else if (line.StartsWith("swipe "))
+            {
+                string arg = line[6..].Trim();
+                if (int.TryParse(arg, out int lane) && lane >= -1 && lane <= 1)
+                    s_writer?.WriteLine($"SWIPE {lane}");
+                else
+                    Console.WriteLine("usage: swipe -1 | 0 | 1");
+            }
             else if (line.StartsWith("setgpa "))
             {
                 // e.g. "setgpa AF3259AC"  or compute it yourself:
