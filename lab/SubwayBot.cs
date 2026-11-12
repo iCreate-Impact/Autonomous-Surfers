@@ -212,9 +212,11 @@ class SubwayBot
 
     static void BotReact(int lane)
     {
+        // lane is TargetLane — where the player is moving TO.
+        // Phase 1: just steer back to center whenever they drift.
         int target = DecideTarget(lane);
-        if (target == lane) return;
-        Swipe(target);
+        if (target != lane)
+            Swipe(target);
     }
 
     static int DecideTarget(int currentLane)
