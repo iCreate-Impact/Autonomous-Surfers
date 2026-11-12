@@ -791,8 +791,8 @@ static bool LaneRead(int32_t* out)
 // ─────────────────────────────────────────────────────────────────────────────
 static bool GuestWrite(uint64_t gpa, const void* src, size_t len)
 {
-    if (!g_pfnWrite || !g_pUVM) return false;
-    return g_pfnWrite(g_pUVM, gpa, src, len) == 0;
+    if (!g_fnWrite || !g_pVM) return false;
+    return g_fnWrite(g_pVM, (RTGCPHYS)gpa, src, len) == 0;
 }
 
 static bool GuestWrite32(uint64_t gpa, uint32_t v) { return GuestWrite(gpa, &v, 4); }
@@ -801,8 +801,8 @@ static bool GuestWriteF (uint64_t gpa, float    v) { return GuestWrite(gpa, &v, 
 
 static bool SwipeLane(int32_t lane)
 {
-    LOG("swipe: g_pfnWrite=%p g_pUVM=%p motor=%016llX",
-        (void*)g_pfnWrite, (void*)g_pUVM,
+    LOG("swipe: g_fnWrite=%p g_pVM=%p motor=%016llX",
+        (void*)g_fnWrite, (void*)g_pVM,
         (unsigned long long)g_motorGpa.load());
     if (lane < -1 || lane > 1) return false;
 
