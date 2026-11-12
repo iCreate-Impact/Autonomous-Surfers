@@ -157,6 +157,7 @@ class SubwayBot
         {
             string? line = await reader.ReadLineAsync();
             if (line == null) break;
+            Console.WriteLine($"[raw]  {line}");
 
             if (line.StartsWith("LANE "))
             {
@@ -208,7 +209,6 @@ class SubwayBot
     static void BotDecideAndAct()
     {
         int lane = s_currentLane;
-        Console.WriteLine($"[dbg]  decide lane={lane} valid={s_laneValid}");
 
         // phase 1: always try to stay center
         // replace this with obstacle lookahead in phase 2
