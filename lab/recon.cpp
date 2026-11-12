@@ -112,6 +112,10 @@ static uint32_t offAccelerate = FB_ACCELERATE;
 static uint32_t offTargetLane = FB_TARGET_LANE;
 static uint32_t offChanging = FB_CHANGING;
 
+// Bridge write export: available alongside the read export in BstkVMM.dll.
+typedef int (VBOXCALL *PFN_PGM_WRITE)(PUVM, uint64_t, const void*, size_t);
+static PFN_PGM_WRITE g_pfnWrite = nullptr;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Guest RAM scanning
 // ─────────────────────────────────────────────────────────────────────────────
@@ -781,6 +785,42 @@ static bool LaneRead(int32_t* out)
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Guest write + lane injection
+// ─────────────────────────────────────────────────────────────────────────────
+static bool GuestWrite(uint64_t gpa, const void* src, size_t len)
+{
+    if (!g_pfnWrite || !g_pUVM) return false;
+    return g_pfnWrite(g_pUVM, gpa, src, len) == 0;
+}
+
+static bool GuestWrite32(uint64_t gpa, uint32_t v) { return GuestWrite(gpa, &v, 4); }
+static bool GuestWrite8 (uint64_t gpa, uint8_t  v) { return GuestWrite(gpa, &v, 1); }
+static bool GuestWriteF (uint64_t gpa, float    v) { return GuestWrite(gpa, &v, 4); }
+
+static bool SwipeLane(int32_t lane)
+{
+    if (lane < -1 || lane > 1) return false;
+
+    uint64_t motor = g_motorGpa.load();
+    if (!motor) {
+        if (!g_useUserGpa.load() || !g_userGpa.load()) return false;
+        motor = g_userGpa.load() - offLaneState - offTargetLane;
+    }
+
+    uint64_t laneStateBase = motor + offLaneState;
+
+    bool ok = GuestWrite8(laneStateBase + offChanging, 1);
+    float zero = 0.0f;
+    ok &= GuestWriteF(laneStateBase + offChanging + 4, zero);
+    ok &= GuestWriteF(laneStateBase + offChanging + 8, 0.23f);
+    ok &= GuestWrite32(laneStateBase + offTargetLane, (uint32_t)lane);
+
+    LOG("swipe: lane=%d motor=%016llX -> %s",
+        lane, (unsigned long long)motor, ok ? "OK" : "PARTIAL");
+    return ok;
+}
+
 static void ValidateCachedMotor()
 {
     if (g_useUserGpa.load()) return;
@@ -930,6 +970,15 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
                     else if (strcmp(cmd, "READ") == 0) {
                         HandleRead(pipe);
                     }
+                    else if (strncmp(cmd, "SWIPE ", 6) == 0) {
+                        int lane = 0;
+                        if (sscanf(cmd + 6, "%d", &lane) == 1 && lane >= -1 && lane <= 1) {
+                            bool ok = SwipeLane(lane);
+                            PipeSend(pipe, ok ? "OK\n" : "ERR swipe failed\n");
+                        } else {
+                            PipeSend(pipe, "ERR bad lane\n");
+                        }
+                    }
                 }
                 Sleep(16);
             }
@@ -937,6 +986,15 @@ static DWORD WINAPI PipeClientThread(LPVOID arg)
         else if (strcmp(buf, "STOP") == 0) {
             g_streaming.store(false);
             if (!PipeSend(pipe, "OK\n")) break;
+        }
+        else if (strncmp(buf, "SWIPE ", 6) == 0) {
+            int lane = 0;
+            if (sscanf(buf + 6, "%d", &lane) == 1 && lane >= -1 && lane <= 1) {
+                bool ok = SwipeLane(lane);
+                if (!PipeSend(pipe, ok ? "OK\n" : "ERR swipe failed\n")) break;
+            } else {
+                if (!PipeSend(pipe, "ERR bad lane (expect -1 0 1)\n")) break;
+            }
         }
         else {
             char resp[160];

@@ -50,9 +50,11 @@ class SubwayBot
 
     // ── state ─────────────────────────────────────────────────────────────────
 
-    static volatile int  s_currentLane = 0;   // -1 LEFT  0 CENTER  1 RIGHT
-    static volatile bool s_laneValid   = false;
-    static volatile bool s_running     = true;
+    static volatile int   s_currentLane = 0;   // -1 LEFT  0 CENTER  1 RIGHT
+    static volatile bool  s_laneValid   = false;
+    static volatile bool  s_running     = true;
+    static long           s_lastSwipeMs = 0;
+    const int            SwipeCooldownMs = 260;
 
     // ── entry point ───────────────────────────────────────────────────────────
 
@@ -192,13 +194,17 @@ class SubwayBot
 
     static void BotLoop()
     {
-        int prevLane = 0;
+        int prevLane = 999;
         while (s_running)
         {
-            if (s_laneValid && s_currentLane != prevLane)
+            if (s_laneValid)
             {
-                BotReact(s_currentLane);
-                prevLane = s_currentLane;
+                int lane = s_currentLane;
+                if (lane != prevLane)
+                {
+                    BotReact(lane);
+                    prevLane = lane;
+                }
             }
             Thread.Sleep(16);
         }
@@ -206,27 +212,45 @@ class SubwayBot
 
     static void BotReact(int lane)
     {
-        // lane: -1 = LEFT, 0 = CENTER, 1 = RIGHT
-        // This is where your obstacle avoidance / scoring logic goes.
-
-        // Example skeleton:
-        switch (lane)
-        {
-            case -1:
-                // Player is in LEFT lane
-                // e.g. SendSwipe(Direction.Right) to move toward center
-                Console.WriteLine("[bot]  → react: player moved LEFT");
-                break;
-            case 0:
-                // Player is in CENTER lane
-                Console.WriteLine("[bot]  → react: player in CENTER");
-                break;
-            case 1:
-                // Player is in RIGHT lane
-                Console.WriteLine("[bot]  → react: player moved RIGHT");
-                break;
-        }
+        int target = DecideTarget(lane);
+        if (target == lane) return;
+        Swipe(target);
     }
+
+    static int DecideTarget(int currentLane)
+    {
+        if (currentLane == 0) return 0;
+        return 0;
+    }
+
+    static void Swipe(int targetLane)
+    {
+        long now = Environment.TickCount64;
+        if (now - s_lastSwipeMs < SwipeCooldownMs)
+        {
+            Console.WriteLine($"[bot]  swipe to {targetLane} suppressed (cooldown)");
+            return;
+        }
+
+        var w = s_writer;
+        if (w == null)
+        {
+            Console.WriteLine("[bot]  swipe skipped (pipe not connected)");
+            return;
+        }
+
+        w.WriteLine($"SWIPE {targetLane}");
+        s_lastSwipeMs = now;
+        Console.WriteLine($"[bot]  SWIPE → {LaneName(targetLane)}");
+    }
+
+    static string LaneName(int lane) => lane switch
+    {
+        -1 => "LEFT",
+         0 => "CENTER",
+         1 => "RIGHT",
+         _ => "?"
+    };
 
     // ── console input ─────────────────────────────────────────────────────────
 
