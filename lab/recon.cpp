@@ -33,7 +33,7 @@
  *   SWIPE <-1|0|1>\n  lane change                 -> OK | ERR
  *   JUMP\n            inject jump                 -> OK | ERR
  *   ROLL\n            inject roll/slide           -> OK | ERR
- *   SCAN\n            one obstacle scan pass      -> OBSTACLE <lane> <z>\n ...
+ *   SCAN\n            one obstacle scan pass      -> OBSTACLE <lane> <z> <gameType>\n ...
  *                                                    CHUNKS_DONE\n
  *                     (SWIPE/JUMP/ROLL/SCAN also handled inside START loop)
  *   banner: STATUS READY HVA_BASE <hex>
@@ -1027,8 +1027,9 @@ static std::atomic<uint64_t> g_chunkBuilderGpa { 0 };
 static ClassInfo g_cbClass;
 
 struct ObstacleHit {
-    int   lane;     // -1 / 0 / 1
-    float zDelta;   // entity world Z - player world Z (positive = ahead)
+    int     lane;     // -1 / 0 / 1
+    float   zDelta;   // entity world Z - player world Z (positive = ahead)
+    int32_t gameType; // EntityType.GameType enum value (0 = unknown)
 };
 
 // ── safe read helpers for Stage 7 ────────────────────────────────────────────
@@ -1147,23 +1148,26 @@ static bool FindClassByName7(const char* name, uint32_t expectedFc,
     return false;
 }
 
-// Find a live instance of a named class by scanning for objects whose
+// Find ALL live instances of a named class by scanning for objects whose
 // klass pointer (object+0x00) points to that class GPA.
-static uint64_t FindInstanceOfClass7(const ClassInfo& ci)
+// Returns up to `cap` candidates for the caller to validate further.
+static std::vector<uint64_t> FindInstancesOfClass7(const ClassInfo& ci,
+                                                    size_t cap = 64)
 {
-    if (!ci.ok) return 0;
+    std::vector<uint64_t> out;
+    if (!ci.ok) return out;
 
     // Build a set of all GVAs mapping the class's GPA page.
     uint64_t clsPage = ci.gpa & ~0xFFFULL;
     auto w = WalkCr3ForPages(g_cr3, { clsPage });
     auto it = w.find(clsPage);
-    if (it == w.end()) return 0;
+    if (it == w.end()) return out;
 
     std::set<uint64_t> classPtrGvas;
     for (uint64_t pageGva : it->second)
         classPtrGvas.insert(pageGva | (ci.gpa & 0xFFF));
 
-    if (classPtrGvas.empty()) return 0;
+    if (classPtrGvas.empty()) return out;
 
     // Scan guest RAM for QWORD == any of those GVAs (potential klass fields).
     auto hits = FindQwordsAny(classPtrGvas, 4096);
@@ -1172,9 +1176,10 @@ static uint64_t FindInstanceOfClass7(const ClassInfo& ci)
         uint64_t monitor = 1;
         GuestRead64(hitGpa + 8, &monitor);
         if (monitor != 0) continue;
-        return hitGpa;
+        out.push_back(hitGpa);
+        if (out.size() >= cap) break;
     }
-    return 0;
+    return out;
 }
 
 // Initialize Stage 7: find ChunkBuilder instance GPA.
@@ -1213,23 +1218,61 @@ static bool Stage7Init()
         return false;
     }
 
-    // Use cached MRGS instance if we already have one and it still looks live.
+    // Dynamically discover the ChunkBuilder field offset within MRGS.
+    // dump.cs confirms it at +0x10; use that as the fallback.
+    static const uint32_t kFbCbOff = 0x10;
+    uint32_t cbOff = FindFieldOffsetByName(g_cr3, mrgs, "ChunkBuilder", kFbCbOff);
+    LOG("stage7: ChunkBuilder field offset in MRGS = +0x%X", cbOff);
+
+    // Use cached MRGS instance if we already have one and the ChunkBuilder
+    // field at that instance still holds a valid user-space GVA.  This catches
+    // the false-positive case (0x4B etc.) without an extra round of scanning.
     uint64_t mrgsInst = g_mrgsInstGpa.load();
     if (mrgsInst) {
-        // Quick liveness check: klass ptr at object+0x00 must still be valid.
         uint64_t klass = 0;
         GuestRead64(mrgsInst, &klass);
         if (!klass) {
-            LOG("stage7: cached MRGS instance stale, re-discovering");
+            LOG("stage7: cached MRGS instance stale (klass null), re-discovering");
             mrgsInst = 0;
             g_mrgsInstGpa.store(0);
+        } else {
+            // Also validate the ChunkBuilder GVA still looks like a pointer.
+            uint64_t testCbGva = S7ReadPtr(mrgsInst + cbOff);
+            if (!testCbGva || testCbGva >= 0x800000000000ULL) {
+                LOG("stage7: cached MRGS instance bad cbGva=%016llX, re-discovering",
+                    (unsigned long long)testCbGva);
+                mrgsInst = 0;
+                g_mrgsInstGpa.store(0);
+            }
         }
     }
 
     if (!mrgsInst) {
-        mrgsInst = FindInstanceOfClass7(mrgs);
+        // Collect all candidates and pick the first one with a plausible
+        // ChunkBuilder GVA — filters out false positives like 0x4B.
+        auto candidates = FindInstancesOfClass7(mrgs);
+        LOG("stage7: MRGS instance candidates=%zu", candidates.size());
+        for (uint64_t cand : candidates) {
+            uint64_t testGva = S7ReadPtr(cand + cbOff);
+            // Must be a canonical user-space GVA and translatable.
+            if (!testGva || testGva >= 0x800000000000ULL) {
+                LOG("stage7: candidate GPA=%016llX cbGva=%016llX rejected (not user ptr)",
+                    (unsigned long long)cand, (unsigned long long)testGva);
+                continue;
+            }
+            uint64_t testGpa = 0;
+            if (!X64Translate(g_cr3, testGva, &testGpa, nullptr)) {
+                LOG("stage7: candidate GPA=%016llX cbGva=%016llX rejected (not mapped)",
+                    (unsigned long long)cand, (unsigned long long)testGva);
+                continue;
+            }
+            mrgsInst = cand;
+            LOG("stage7: MRGS instance GPA=%016llX accepted (cbGva=%016llX)",
+                (unsigned long long)mrgsInst, (unsigned long long)testGva);
+            break;
+        }
         if (!mrgsInst) {
-            LOG("stage7: MainRouteGenerationSystem instance not found");
+            LOG("stage7: MainRouteGenerationSystem instance not found (no valid candidate)");
             g_stage7Backoff.store(kStage7BackoffScans);
             return false;
         }
@@ -1238,12 +1281,12 @@ static bool Stage7Init()
             (unsigned long long)mrgsInst);
     }
 
-    // Read ChunkBuilder GVA at instance+0x10.
+    // Read ChunkBuilder GVA at instance+cbOff.
     // il2cpp stores object references as guest virtual addresses (GVAs), so we
     // must translate through g_cr3 before reading any fields on the object.
-    uint64_t cbGva = S7ReadPtr(mrgsInst + 0x10);
+    uint64_t cbGva = S7ReadPtr(mrgsInst + cbOff);
     if (!cbGva) {
-        LOG("stage7: ChunkBuilder GVA at MRGS+0x10 is null");
+        LOG("stage7: ChunkBuilder GVA at MRGS+0x%X is null", cbOff);
         return false;
     }
 
@@ -1271,8 +1314,8 @@ static bool Stage7Init()
     }
 
     g_chunkBuilderGpa.store(cbGpa);
-    LOG("stage7: ChunkBuilder cbGva=%016llX cbGpa=%016llX _chunksGva=%016llX OK",
-        (unsigned long long)cbGva, (unsigned long long)cbGpa,
+    LOG("stage7: ChunkBuilder cbOff=+0x%X cbGva=%016llX cbGpa=%016llX _chunksGva=%016llX OK",
+        cbOff, (unsigned long long)cbGva, (unsigned long long)cbGpa,
         (unsigned long long)chunksGva);
     return true;
 }
@@ -1398,7 +1441,7 @@ static std::vector<ObstacleHit> ScanObstacles()
                 }
             }
 
-            results.push_back({ lane, zDelta });
+            results.push_back({ lane, zDelta, gameType });
         }
     }
 
@@ -1425,9 +1468,10 @@ static void HandleScan(HANDLE pipe)
     }
 
     auto obs = ScanObstacles();
-    char buf[64];
+    char buf[80];
     for (const auto& o : obs) {
-        snprintf(buf, sizeof(buf), "OBSTACLE %d %.2f\n", o.lane, o.zDelta);
+        snprintf(buf, sizeof(buf), "OBSTACLE %d %.2f %d\n",
+                 o.lane, o.zDelta, o.gameType);
         if (!PipeSend(pipe, buf)) return;
     }
     PipeSend(pipe, "CHUNKS_DONE\n");
