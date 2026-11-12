@@ -149,6 +149,9 @@ class SubwayBot
         string? startAck = await reader.ReadLineAsync();
         Console.WriteLine($"[pipe] START ack: {startAck}");
 
+        // Force an initial lane read so s_laneValid is set before BotLoop acts
+        await writer.WriteLineAsync("READ");
+
         // Read stream
         while (s_running)
         {
@@ -205,6 +208,7 @@ class SubwayBot
     static void BotDecideAndAct()
     {
         int lane = s_currentLane;
+        Console.WriteLine($"[dbg]  decide lane={lane} valid={s_laneValid}");
 
         // phase 1: always try to stay center
         // replace this with obstacle lookahead in phase 2
